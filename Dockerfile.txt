@@ -2,13 +2,15 @@ FROM continuumio/miniconda3:latest
 
 WORKDIR /app
 
-RUN conda install -c conda-forge pythonocc-core -y
+# Install pythonocc-core via conda
+RUN conda install -c conda-forge pythonocc-core=7.7.0 -y
 
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-EXPOSE 8080
+EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
