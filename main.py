@@ -5,6 +5,16 @@ import base64
 import tempfile
 import os
 
+# Verify OCC at startup
+try:
+    import OCC
+    print(f"OCC loaded successfully from: {OCC.__file__}")
+except ImportError as e:
+    print(f"FATAL: Failed to import OCC: {e}")
+    raise
+
+from fastapi import FastAPI, HTTPException
+
 app = FastAPI()
 
 app.add_middleware(
@@ -132,3 +142,4 @@ async def analyze_step(request: AnalyzeRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
