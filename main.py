@@ -1,42 +1,44 @@
-import logging
+# main.py - Complete pythonOCC Feature Extraction API with Location Data
+import os
 import base64
 import tempfile
-import os
-
-# Configure logging first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Import OCC at module level (loaded at startup, not per-request)
-# This prevents timeout/memory issues during request handling
-try:
-    from OCC.Core.STEPControl import STEPControl_Reader
-    from OCC.Core.IFSelect import IFSelect_RetDone
-    from OCC.Core.BRepGProp import brepgprop_VolumeProperties, brepgprop_SurfaceProperties
-    from OCC.Core.GProp import GProp_GProps
-    from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_SOLID
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.BRep import BRep_Tool
-    from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.BRepBndLib import brepbndlib_Add
-    from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
-    from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere, GeomAbs_Torus, GeomAbs_Circle
-    logger.info("OCC libraries loaded successfully at startup")
-except ImportError as e:
-    logger.fatal(f"FATAL: Failed to import OCC libraries: {e}")
-    raise
-
+import logging
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import OCC modules at startup to fail fast if environment is broken
+try:
+    from OCC.Core.STEPControl import STEPControl_Reader
+    from OCC.Core.IFSelect import IFSelect_RetDone
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import (
+        TopAbs_FACE, TopAbs_EDGE, TopAbs_SOLID
+    )
+    from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
+    from OCC.Core.GeomAbs import (
+        GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Cone,
+        GeomAbs_Torus, GeomAbs_Sphere, GeomAbs_Circle
+    )
+    from OCC.Core.BRepGProp import brepgprop_SurfaceProperties, brepgprop_VolumeProperties
+    from OCC.Core.GProp import GProp_GProps
+    from OCC.Core.TopoDS import topods_Face, topods_Solid
+    from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.BRepBndLib import brepbndlib_Add
+    from OCC.Core.gp import gp_Pnt
+    logger.info("OCC modules imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import OCC modules: {e}")
+    raise
 
 app = FastAPI(title="PythonOCC Feature Extraction API")
 
-# Enable CORS
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,234 +47,358 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# Request/Response models
 class AnalyzeRequest(BaseModel):
     fileBase64: str
     fileName: str
-
 
 class FeatureLocation(BaseModel):
     x: float
     y: float
     z: float
 
-
 class ExtractedFeature(BaseModel):
     type: str
-    parameters: Dict[str, float]
+    count: int
+    parameters: dict
     location: Optional[FeatureLocation] = None
-    count: Optional[int] = None
 
+class Dimensions(BaseModel):
+    x: float
+    y: float
+    z: float
 
 class AnalyzeResponse(BaseModel):
     success: bool
-    features: Optional[List[ExtractedFeature]] = None
-    dimensions: Optional[Dict[str, float]] = None
+    features: Optional[list[ExtractedFeature]] = None
+    dimensions: Optional[Dimensions] = None
     volume: Optional[float] = None
     surfaceArea: Optional[float] = None
+    complexityScore: Optional[float] = None
     error: Optional[str] = None
 
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "pythonOCC Feature Extraction API"}
+def get_face_centroid(face) -> Optional[FeatureLocation]:
+    """Calculate the center of mass (centroid) of a face using GProp."""
+    try:
+        props = GProp_GProps()
+        brepgprop_SurfaceProperties(face, props)
+        center = props.CentreOfMass()
+        return FeatureLocation(
+            x=round(center.X(), 4),
+            y=round(center.Y(), 4),
+            z=round(center.Z(), 4)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to get face centroid: {e}")
+        return None
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "occ_loaded": True}
+def get_solid_centroid(solid) -> Optional[FeatureLocation]:
+    """Calculate the center of mass of a solid."""
+    try:
+        props = GProp_GProps()
+        brepgprop_VolumeProperties(solid, props)
+        center = props.CentreOfMass()
+        return FeatureLocation(
+            x=round(center.X(), 4),
+            y=round(center.Y(), 4),
+            z=round(center.Z(), 4)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to get solid centroid: {e}")
+        return None
 
 
-def analyze_shape(shape):
-    """Analyze a shape and extract features."""
-    features = []
+def analyze_step_file(file_path: str) -> dict:
+    """Analyze a STEP file and extract features with locations."""
     
-    # Count different surface types
-    planar_faces = 0
-    cylindrical_faces = 0
-    conical_faces = 0
-    spherical_faces = 0
-    toroidal_faces = 0
-    other_faces = 0
+    # Read STEP file
+    reader = STEPControl_Reader()
+    status = reader.ReadFile(file_path)
+    
+    if status != IFSelect_RetDone:
+        raise ValueError("Failed to read STEP file")
+    
+    reader.TransferRoots()
+    shape = reader.OneShape()
+    
+    if shape.IsNull():
+        raise ValueError("No shape found in STEP file")
+    
+    # Calculate bounding box for dimensions
+    bbox = Bnd_Box()
+    brepbndlib_Add(shape, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    
+    dimensions = Dimensions(
+        x=round(xmax - xmin, 2),
+        y=round(ymax - ymin, 2),
+        z=round(zmax - zmin, 2)
+    )
+    
+    # Calculate volume and surface area
+    vol_props = GProp_GProps()
+    brepgprop_VolumeProperties(shape, vol_props)
+    volume = round(abs(vol_props.Mass()), 2)
+    
+    surf_props = GProp_GProps()
+    brepgprop_SurfaceProperties(shape, surf_props)
+    surface_area = round(surf_props.Mass(), 2)
+    
+    # Feature detection with location tracking
+    features_data = {
+        'hole': {'count': 0, 'radii': [], 'locations': []},
+        'pocket': {'count': 0, 'depths': [], 'locations': []},
+        'fillet': {'count': 0, 'radii': [], 'locations': []},
+        'chamfer': {'count': 0, 'angles': [], 'locations': []},
+        'boss': {'count': 0, 'heights': [], 'locations': []},
+        'slot': {'count': 0, 'widths': [], 'locations': []},
+        'thread': {'count': 0, 'diameters': [], 'locations': []},
+    }
     
     # Analyze faces
     face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    face_count = 0
+    cylindrical_faces = []
+    planar_faces = []
+    
     while face_explorer.More():
-        face = face_explorer.Current()
+        face = topods_Face(face_explorer.Current())
+        face_count += 1
+        
         try:
-            surface = BRepAdaptor_Surface(face)
-            surface_type = surface.GetType()
+            adaptor = BRepAdaptor_Surface(face)
+            surface_type = adaptor.GetType()
             
-            if surface_type == GeomAbs_Plane:
-                planar_faces += 1
-            elif surface_type == GeomAbs_Cylinder:
-                cylindrical_faces += 1
-            elif surface_type == GeomAbs_Cone:
-                conical_faces += 1
-            elif surface_type == GeomAbs_Sphere:
-                spherical_faces += 1
+            # HOLES: Cylindrical faces (internal cylinders)
+            if surface_type == GeomAbs_Cylinder:
+                cylinder = adaptor.Cylinder()
+                radius = round(cylinder.Radius(), 4)
+                
+                # Get centroid of this cylindrical face
+                centroid = get_face_centroid(face)
+                
+                # Check if it's likely a hole (smaller radius, internal)
+                if radius < min(dimensions.x, dimensions.y, dimensions.z) * 0.3:
+                    features_data['hole']['count'] += 1
+                    features_data['hole']['radii'].append(radius)
+                    if centroid:
+                        features_data['hole']['locations'].append(centroid)
+                
+                cylindrical_faces.append({
+                    'radius': radius,
+                    'location': centroid
+                })
+            
+            # POCKETS: Planar faces (potential pocket bottoms)
+            elif surface_type == GeomAbs_Plane:
+                centroid = get_face_centroid(face)
+                planar_faces.append({
+                    'location': centroid
+                })
+            
+            # FILLETS: Toroidal faces (rounded edges)
             elif surface_type == GeomAbs_Torus:
-                toroidal_faces += 1
-            else:
-                other_faces += 1
+                torus = adaptor.Torus()
+                minor_radius = round(torus.MinorRadius(), 4)
+                centroid = get_face_centroid(face)
+                
+                features_data['fillet']['count'] += 1
+                features_data['fillet']['radii'].append(minor_radius)
+                if centroid:
+                    features_data['fillet']['locations'].append(centroid)
+            
+            # CHAMFERS: Conical faces
+            elif surface_type == GeomAbs_Cone:
+                cone = adaptor.Cone()
+                angle = round(abs(cone.SemiAngle()) * 180 / 3.14159, 1)
+                centroid = get_face_centroid(face)
+                
+                features_data['chamfer']['count'] += 1
+                features_data['chamfer']['angles'].append(angle)
+                if centroid:
+                    features_data['chamfer']['locations'].append(centroid)
+            
+            # BOSSES: Spherical faces (dome features)
+            elif surface_type == GeomAbs_Sphere:
+                sphere = adaptor.Sphere()
+                radius = round(sphere.Radius(), 4)
+                centroid = get_face_centroid(face)
+                
+                features_data['boss']['count'] += 1
+                features_data['boss']['heights'].append(radius)
+                if centroid:
+                    features_data['boss']['locations'].append(centroid)
+                    
         except Exception as e:
             logger.warning(f"Error analyzing face: {e}")
-            other_faces += 1
+            continue
         
         face_explorer.Next()
     
-    # Detect holes (cylindrical faces often indicate holes)
-    if cylindrical_faces > 0:
-        features.append(ExtractedFeature(
-            type="hole",
-            parameters={"diameter": 10.0, "depth": 15.0},  # Placeholder values
-            count=cylindrical_faces
-        ))
+    # Detect pockets from planar face clusters
+    # Simple heuristic: internal planar faces that aren't on the bounding box
+    tolerance = 0.1
+    for pf in planar_faces:
+        if pf['location']:
+            loc = pf['location']
+            # Check if face is internal (not on bounding box boundary)
+            is_internal = (
+                (loc.x > xmin + tolerance and loc.x < xmax - tolerance) or
+                (loc.y > ymin + tolerance and loc.y < ymax - tolerance) or
+                (loc.z > zmin + tolerance and loc.z < zmax - tolerance)
+            )
+            if is_internal:
+                features_data['pocket']['count'] += 1
+                features_data['pocket']['locations'].append(pf['location'])
     
-    # Detect fillets (toroidal faces often indicate fillets)
-    if toroidal_faces > 0:
-        features.append(ExtractedFeature(
-            type="fillet",
-            parameters={"radius": 2.0},
-            count=toroidal_faces
-        ))
+    # Limit pocket detection to reasonable count
+    if features_data['pocket']['count'] > 20:
+        features_data['pocket']['count'] = features_data['pocket']['count'] // 4
+        features_data['pocket']['locations'] = features_data['pocket']['locations'][:features_data['pocket']['count']]
     
-    # Detect pockets (based on face topology - simplified)
-    if planar_faces > 6:  # More than a simple box
-        pocket_count = max(1, (planar_faces - 6) // 4)
-        features.append(ExtractedFeature(
-            type="pocket",
-            parameters={"length": 50.0, "width": 30.0, "depth": 10.0},
-            count=pocket_count
-        ))
-    
-    # Detect chamfers (conical faces often indicate chamfers)
-    if conical_faces > 0:
-        features.append(ExtractedFeature(
-            type="chamfer",
-            parameters={"distance": 1.5, "angle": 45.0},
-            count=conical_faces
-        ))
-    
-    # Count edges for potential thread detection
-    edge_count = 0
+    # Analyze edges for threads (circular edges on cylindrical faces)
     edge_explorer = TopExp_Explorer(shape, TopAbs_EDGE)
+    circular_edge_count = 0
+    
     while edge_explorer.More():
-        edge_count += 1
+        edge = edge_explorer.Current()
+        try:
+            adaptor = BRepAdaptor_Curve(edge)
+            if adaptor.GetType() == GeomAbs_Circle:
+                circle = adaptor.Circle()
+                radius = round(circle.Radius(), 4)
+                center = circle.Location()
+                
+                # Threads are typically on smaller cylindrical features
+                if radius < min(dimensions.x, dimensions.y) * 0.15:
+                    circular_edge_count += 1
+                    if circular_edge_count <= 5:  # Limit thread detection
+                        features_data['thread']['diameters'].append(radius * 2)
+                        features_data['thread']['locations'].append(FeatureLocation(
+                            x=round(center.X(), 4),
+                            y=round(center.Y(), 4),
+                            z=round(center.Z(), 4)
+                        ))
+        except:
+            pass
         edge_explorer.Next()
     
-    # High edge count with cylindrical faces might indicate threads
-    if cylindrical_faces > 0 and edge_count > 50:
-        features.append(ExtractedFeature(
-            type="thread",
-            parameters={"diameter": 8.0, "pitch": 1.25},
-            count=1
-        ))
+    # Estimate thread count from circular edges
+    if circular_edge_count > 10:
+        features_data['thread']['count'] = circular_edge_count // 8
     
-    logger.info(f"Face analysis: planar={planar_faces}, cylindrical={cylindrical_faces}, "
-                f"conical={conical_faces}, spherical={spherical_faces}, "
-                f"toroidal={toroidal_faces}, other={other_faces}")
+    # Build features list with averaged/representative locations
+    features = []
     
-    return features
+    for feature_type, data in features_data.items():
+        if data['count'] > 0:
+            # Get representative location (first one, or average)
+            location = None
+            if data['locations']:
+                if len(data['locations']) == 1:
+                    location = data['locations'][0]
+                else:
+                    # Use centroid of all feature locations
+                    avg_x = sum(loc.x for loc in data['locations']) / len(data['locations'])
+                    avg_y = sum(loc.y for loc in data['locations']) / len(data['locations'])
+                    avg_z = sum(loc.z for loc in data['locations']) / len(data['locations'])
+                    location = FeatureLocation(
+                        x=round(avg_x, 4),
+                        y=round(avg_y, 4),
+                        z=round(avg_z, 4)
+                    )
+            
+            # Build parameters
+            parameters = {}
+            if feature_type == 'hole' and data['radii']:
+                parameters['diameter'] = round(min(data['radii']) * 2, 2)
+                parameters['max_diameter'] = round(max(data['radii']) * 2, 2)
+            elif feature_type == 'fillet' and data['radii']:
+                parameters['radius'] = round(sum(data['radii']) / len(data['radii']), 2)
+            elif feature_type == 'chamfer' and data['angles']:
+                parameters['angle'] = round(sum(data['angles']) / len(data['angles']), 1)
+            elif feature_type == 'boss' and data['heights']:
+                parameters['height'] = round(sum(data['heights']) / len(data['heights']), 2)
+            elif feature_type == 'pocket' and data['depths']:
+                parameters['depth'] = round(sum(data['depths']) / len(data['depths']), 2)
+            elif feature_type == 'thread' and data['diameters']:
+                parameters['diameter'] = round(sum(data['diameters']) / len(data['diameters']), 2)
+            
+            features.append(ExtractedFeature(
+                type=feature_type,
+                count=data['count'],
+                parameters=parameters,
+                location=location
+            ))
+    
+    # Calculate complexity score
+    complexity_score = (
+        face_count * 0.5 +
+        features_data['hole']['count'] * 2 +
+        features_data['pocket']['count'] * 3 +
+        features_data['fillet']['count'] * 1 +
+        features_data['chamfer']['count'] * 1.5 +
+        features_data['thread']['count'] * 4 +
+        features_data['boss']['count'] * 2
+    )
+    
+    return {
+        'features': features,
+        'dimensions': dimensions,
+        'volume': volume,
+        'surfaceArea': surface_area,
+        'complexityScore': round(min(complexity_score, 100), 1)
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "occ_available": True}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(request: AnalyzeRequest):
-    logger.info(f"Received analyze request for: {request.fileName}")
-    
-    temp_file = None
+async def analyze_step(request: AnalyzeRequest):
+    """Analyze a STEP file and extract features with precise locations."""
     try:
-        # Decode base64 file content
+        # Decode base64 file
+        file_bytes = base64.b64decode(request.fileBase64)
+        
+        # Write to temp file
+        with tempfile.NamedTemporaryFile(suffix='.step', delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        
         try:
-            file_content = base64.b64decode(request.fileBase64)
-        except Exception as e:
-            logger.error(f"Failed to decode base64: {e}")
-            return AnalyzeResponse(success=False, error=f"Invalid base64 encoding: {str(e)}")
-        
-        # Write to temporary file
-        suffix = os.path.splitext(request.fileName)[1] or '.step'
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        temp_file.write(file_content)
-        temp_file.close()
-        
-        logger.info(f"Wrote {len(file_content)} bytes to temp file: {temp_file.name}")
-        
-        # Read STEP file
-        step_reader = STEPControl_Reader()
-        status = step_reader.ReadFile(temp_file.name)
-        
-        if status != IFSelect_RetDone:
-            logger.error(f"Failed to read STEP file, status: {status}")
-            return AnalyzeResponse(success=False, error=f"Failed to read STEP file (status: {status})")
-        
-        # Transfer to shape
-        step_reader.TransferRoots()
-        shape = step_reader.OneShape()
-        
-        if shape.IsNull():
-            logger.error("Shape is null after transfer")
-            return AnalyzeResponse(success=False, error="Could not extract shape from STEP file")
-        
-        logger.info("Successfully loaded STEP file, analyzing geometry...")
-        
-        # Calculate bounding box
-        bbox = Bnd_Box()
-        brepbndlib_Add(shape, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        
-        dimensions = {
-            "length": round(abs(xmax - xmin), 2),
-            "width": round(abs(ymax - ymin), 2),
-            "height": round(abs(zmax - zmin), 2)
-        }
-        
-        logger.info(f"Bounding box: {dimensions}")
-        
-        # Calculate volume
-        volume_props = GProp_GProps()
-        brepgprop_VolumeProperties(shape, volume_props)
-        volume = round(abs(volume_props.Mass()), 2)
-        
-        # Calculate surface area
-        surface_props = GProp_GProps()
-        brepgprop_SurfaceProperties(shape, surface_props)
-        surface_area = round(abs(surface_props.Mass()), 2)
-        
-        logger.info(f"Volume: {volume}, Surface Area: {surface_area}")
-        
-        # Extract features
-        features = analyze_shape(shape)
-        
-        logger.info(f"Extracted {len(features)} feature types")
-        
-        return AnalyzeResponse(
-            success=True,
-            features=features,
-            dimensions=dimensions,
-            volume=volume,
-            surfaceArea=surface_area
-        )
-        
+            # Analyze the file
+            result = analyze_step_file(tmp_path)
+            
+            return AnalyzeResponse(
+                success=True,
+                features=result['features'],
+                dimensions=result['dimensions'],
+                volume=result['volume'],
+                surfaceArea=result['surfaceArea'],
+                complexityScore=result['complexityScore']
+            )
+        finally:
+            # Clean up temp file
+            os.unlink(tmp_path)
+            
     except Exception as e:
-        logger.exception(f"Error analyzing STEP file: {e}")
-        return AnalyzeResponse(success=False, error=str(e))
-    
-    finally:
-        # Clean up temp file
-        if temp_file and os.path.exists(temp_file.name):
-            try:
-                os.unlink(temp_file.name)
-                logger.info(f"Cleaned up temp file: {temp_file.name}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp file: {e}")
+        logger.error(f"Analysis failed: {e}")
+        return AnalyzeResponse(
+            success=False,
+            error=str(e)
+        )
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), log_level="info")
-
-
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 
