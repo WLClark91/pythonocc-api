@@ -1,4 +1,5 @@
 # main.py - Complete pythonOCC API for STEP file analysis with mesh generation
+# Updated with proper hole vs boss detection based on surface normal direction
 
 import base64
 import io
@@ -15,7 +16,7 @@ from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_REVERSED
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.BRepGProp import brepgprop
@@ -27,7 +28,9 @@ from OCC.Core.GeomAbs import (
     GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Torus, 
     GeomAbs_Cone, GeomAbs_Circle
 )
-from OCC.Core.gp import gp_Pnt
+from OCC.Core.gp import gp_Pnt, gp_Vec
+from OCC.Core.BRepLProp import BRepLProp_SLProps
+from OCC.Core.BRepTools import breptools
 
 app = FastAPI(title="PythonOCC STEP Analyzer API")
 
@@ -54,6 +57,7 @@ class FeatureMetadata(BaseModel):
     faceIds: Optional[list] = None
     confidence: Optional[float] = None
     detectionMethod: Optional[str] = None
+    normalDirection: Optional[str] = None  # Added to track normal direction
 
 class ExtractedFeature(BaseModel):
     type: str
@@ -141,35 +145,131 @@ def get_face_centroid(face) -> FeatureLocation:
     return FeatureLocation(x=center.X(), y=center.Y(), z=center.Z())
 
 
+def is_cylindrical_face_a_boss(face, adaptor) -> tuple:
+    """
+    Determine if a cylindrical face is a BOSS or HOLE by analyzing surface normal direction.
+    
+    Algorithm:
+    1. Get the cylinder's axis direction and location
+    2. Sample a point on the face surface
+    3. Get the surface normal at that point
+    4. Calculate the radial direction (from axis to surface point)
+    5. Compare the normal direction with the radial direction
+    6. If normal points TOWARD axis center → HOLE (internal cavity)
+    7. If normal points AWAY from axis center → BOSS (external protrusion)
+    
+    Returns:
+        tuple: (is_boss: bool, confidence: float, normal_direction: str)
+    """
+    try:
+        cylinder = adaptor.Cylinder()
+        axis = cylinder.Axis()
+        axis_dir = axis.Direction()
+        axis_loc = axis.Location()
+        
+        # Get UV bounds of the face
+        u_min, u_max, v_min, v_max = breptools.UVBounds(face)
+        
+        # Sample point at the middle of the face
+        u_mid = (u_min + u_max) / 2.0
+        v_mid = (v_min + v_max) / 2.0
+        
+        # Get point on surface
+        surface_pnt = adaptor.Value(u_mid, v_mid)
+        
+        # Get surface normal at this point using BRepLProp_SLProps
+        props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 1, 1e-6)
+        
+        if not props.IsNormalDefined():
+            # Fallback: if normal not defined, use heuristic based on radius
+            return (False, 0.5, "undefined")
+        
+        normal = props.Normal()
+        
+        # Account for face orientation (REVERSED means normal is flipped)
+        if face.Orientation() == TopAbs_REVERSED:
+            normal.Reverse()
+        
+        # Calculate radial direction: from axis to surface point
+        # Project point onto axis to find closest point on axis
+        point_vec = gp_Vec(axis_loc, surface_pnt)
+        axis_vec = gp_Vec(axis_dir)
+        
+        # Projection length along axis
+        proj_length = point_vec.Dot(axis_vec)
+        
+        # Closest point on axis
+        axis_point = gp_Pnt(
+            axis_loc.X() + axis_dir.X() * proj_length,
+            axis_loc.Y() + axis_dir.Y() * proj_length,
+            axis_loc.Z() + axis_dir.Z() * proj_length
+        )
+        
+        # Radial direction: from axis to surface point
+        radial_vec = gp_Vec(axis_point, surface_pnt)
+        if radial_vec.Magnitude() > 1e-10:
+            radial_vec.Normalize()
+        else:
+            # Point is on the axis, can't determine
+            return (False, 0.5, "on_axis")
+        
+        # Compare normal with radial direction
+        # Positive dot product = normal points outward (BOSS)
+        # Negative dot product = normal points inward (HOLE)
+        normal_vec = gp_Vec(normal.X(), normal.Y(), normal.Z())
+        dot_product = normal_vec.Dot(radial_vec)
+        
+        # Determine feature type based on normal direction
+        is_boss = dot_product > 0
+        
+        # Confidence is based on how clearly the normal points in/out
+        confidence = min(0.95, 0.7 + abs(dot_product) * 0.25)
+        
+        normal_direction = "outward" if is_boss else "inward"
+        
+        return (is_boss, confidence, normal_direction)
+        
+    except Exception as e:
+        print(f"Error determining boss/hole: {e}")
+        return (False, 0.5, "error")
+
+
 def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
     """Analyze a single face to detect if it's part of a feature."""
     try:
         adaptor = BRepAdaptor_Surface(face)
         surface_type = adaptor.GetType()
         
-        # Cylindrical face -> likely a hole or boss
+        # Cylindrical face -> could be hole or boss
         if surface_type == GeomAbs_Cylinder:
             cylinder = adaptor.Cylinder()
             radius = cylinder.Radius()
             
-            # Estimate depth from face bounds
+            # Estimate depth/height from face bounds
             umin, umax, vmin, vmax = adaptor.FirstUParameter(), adaptor.LastUParameter(), \
                                       adaptor.FirstVParameter(), adaptor.LastVParameter()
-            depth = abs(vmax - vmin)
+            height_or_depth = abs(vmax - vmin)
             
-            # Determine if hole or boss based on face orientation
-            # (simplified: we'll call small cylinders "holes")
-            feature_type = "hole" if radius < 50 else "boss"
+            # Use surface normal analysis to determine hole vs boss
+            is_boss, confidence, normal_direction = is_cylindrical_face_a_boss(face, adaptor)
+            
+            if is_boss:
+                feature_type = "boss"
+                params = {"diameter": radius * 2, "height": height_or_depth}
+            else:
+                feature_type = "hole"
+                params = {"diameter": radius * 2, "depth": height_or_depth}
             
             return ExtractedFeature(
                 type=feature_type,
-                parameters={"diameter": radius * 2, "depth": depth},
+                parameters=params,
                 location=get_face_centroid(face),
                 id=str(uuid.uuid4()),
                 metadata=FeatureMetadata(
                     faceIds=[face_id],
-                    confidence=0.85,
-                    detectionMethod="cylindrical_face"
+                    confidence=confidence,
+                    detectionMethod="cylindrical_face_normal_analysis",
+                    normalDirection=normal_direction
                 )
             )
         
@@ -397,6 +497,10 @@ async def analyze_step(request: AnalyzeRequest):
         features = extract_features(shape)
         print(f"Extracted {len(features)} features")
         
+        # Log feature types for debugging
+        for f in features:
+            print(f"  - {f.type}: {f.parameters}, confidence: {f.metadata.confidence if f.metadata else 'N/A'}, normal: {f.metadata.normalDirection if f.metadata else 'N/A'}")
+        
         # Generate mesh with feature mapping
         mesh_data = generate_mesh_data(shape, features)
         print(f"Generated mesh: {len(mesh_data.vertices)//3} vertices, {len(mesh_data.indices)//3} triangles")
@@ -434,5 +538,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
