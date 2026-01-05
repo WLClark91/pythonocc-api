@@ -12,8 +12,10 @@
 # v1.5.0 (2026-01-05) - Improved pocket detection with concavity, wall, depth, and boundary analysis
 # v1.6.0 (2026-01-05) - Revised pocket criteria: edge-sharing walls (no count), 0.01mm depth, slot classification
 # v1.6.1 (2026-01-05) - Fixed TopExp import: use 'topexp' module (lowercase) for pythonOCC 7.7.0 compatibility
+# v1.7.0 (2026-01-05) - Added comprehensive surface detection: planar, cylindrical, conical, spherical, toroidal, freeform
+#                       with stock face tagging, area, orientation, and curvature complexity parameters
 
-API_VERSION = "1.6.1"
+API_VERSION = "1.7.0"
 API_VERSION_DATE = "2026-01-05"
 
 import base64
@@ -45,7 +47,9 @@ from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
 from OCC.Core.GeomAbs import (
     GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Torus, 
-    GeomAbs_Cone, GeomAbs_Circle
+    GeomAbs_Cone, GeomAbs_Circle, GeomAbs_Sphere,
+    GeomAbs_BezierSurface, GeomAbs_BSplineSurface, GeomAbs_SurfaceOfRevolution,
+    GeomAbs_SurfaceOfExtrusion, GeomAbs_OffsetSurface, GeomAbs_OtherSurface
 )
 from OCC.Core.gp import gp_Pnt, gp_Vec
 from OCC.Core.BRepLProp import BRepLProp_SLProps
@@ -562,7 +566,7 @@ def is_cylindrical_face_a_boss(face, adaptor) -> tuple:
 
 
 # =============================================================================
-# ENHANCED POCKET DETECTION HELPERS
+# SURFACE DETECTION HELPERS (v1.7.0)
 # =============================================================================
 
 def get_shape_center(shape) -> gp_Pnt:
@@ -571,6 +575,245 @@ def get_shape_center(shape) -> gp_Pnt:
     brepbndlib.Add(shape, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     return gp_Pnt((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+
+
+def get_shape_bounding_box_expanded(shape, tolerance: float = 0.5) -> dict:
+    """Get shape bounding box with tolerance for stock face detection."""
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    return {
+        "xmin": xmin - tolerance,
+        "xmax": xmax + tolerance,
+        "ymin": ymin - tolerance,
+        "ymax": ymax + tolerance,
+        "zmin": zmin - tolerance,
+        "zmax": zmax + tolerance
+    }
+
+
+def is_stock_face(face, bbox_expanded: dict) -> Tuple[bool, Optional[str]]:
+    """
+    Determine if a face is at the bounding box boundary (stock material face).
+    
+    Stock faces are faces whose centroids lie on or very near the bounding box
+    boundary - these are typically the outer surfaces of raw stock material.
+    
+    Returns:
+        tuple: (is_stock: bool, boundary_type: Optional[str])
+               boundary_type is one of: 'top', 'bottom', 'front', 'back', 'left', 'right'
+    """
+    try:
+        centroid = get_face_centroid(face)
+        x, y, z = centroid.x, centroid.y, centroid.z
+        
+        tolerance = 0.5  # mm tolerance for boundary detection
+        
+        # Check each boundary
+        if abs(z - bbox_expanded["zmax"]) < tolerance:
+            return (True, "top")
+        if abs(z - bbox_expanded["zmin"]) < tolerance:
+            return (True, "bottom")
+        if abs(y - bbox_expanded["ymax"]) < tolerance:
+            return (True, "back")
+        if abs(y - bbox_expanded["ymin"]) < tolerance:
+            return (True, "front")
+        if abs(x - bbox_expanded["xmax"]) < tolerance:
+            return (True, "right")
+        if abs(x - bbox_expanded["xmin"]) < tolerance:
+            return (True, "left")
+        
+        return (False, None)
+        
+    except Exception as e:
+        print(f"Error checking stock face: {e}")
+        return (False, None)
+
+
+def get_surface_orientation(face, adaptor) -> dict:
+    """
+    Get the surface normal/orientation at the face centroid.
+    
+    Returns:
+        dict with 'normal' (x, y, z), 'angle_from_z' (degrees from vertical),
+        and 'orientation' (human-readable: 'horizontal', 'vertical', 'angled')
+    """
+    try:
+        u_min, u_max, v_min, v_max = breptools.UVBounds(face)
+        u_mid = (u_min + u_max) / 2.0
+        v_mid = (v_min + v_max) / 2.0
+        
+        props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 1, 1e-6)
+        
+        if not props.IsNormalDefined():
+            return {"normal": None, "angle_from_z": None, "orientation": "unknown"}
+        
+        normal = props.Normal()
+        
+        # Account for face orientation
+        if face.Orientation() == TopAbs_REVERSED:
+            normal.Reverse()
+        
+        nx, ny, nz = normal.X(), normal.Y(), normal.Z()
+        
+        # Calculate angle from Z axis (vertical)
+        import math
+        z_axis = gp_Vec(0, 0, 1)
+        normal_vec = gp_Vec(nx, ny, nz)
+        angle_rad = z_axis.Angle(normal_vec)
+        angle_deg = math.degrees(angle_rad)
+        
+        # Classify orientation
+        if angle_deg < 15 or angle_deg > 165:
+            orientation = "horizontal"
+        elif 75 < angle_deg < 105:
+            orientation = "vertical"
+        else:
+            orientation = "angled"
+        
+        return {
+            "normal": {"x": round(nx, 4), "y": round(ny, 4), "z": round(nz, 4)},
+            "angle_from_z": round(angle_deg, 1),
+            "orientation": orientation
+        }
+        
+    except Exception as e:
+        print(f"Error getting surface orientation: {e}")
+        return {"normal": None, "angle_from_z": None, "orientation": "unknown"}
+
+
+def get_curvature_complexity(adaptor, surface_type) -> dict:
+    """
+    Determine the curvature complexity of a surface for machining classification.
+    
+    Returns:
+        dict with 'complexity' ('simple', 'moderate', 'complex'),
+        'requires_axis' (3, 4, or 5 axis machining), and 'curvature_type'
+    """
+    complexity_map = {
+        GeomAbs_Plane: ("simple", 3, "flat"),
+        GeomAbs_Cylinder: ("simple", 3, "single_curved"),
+        GeomAbs_Cone: ("simple", 4, "single_curved_variable"),
+        GeomAbs_Sphere: ("moderate", 4, "double_curved_uniform"),
+        GeomAbs_Torus: ("moderate", 4, "double_curved"),
+        GeomAbs_BezierSurface: ("complex", 5, "freeform"),
+        GeomAbs_BSplineSurface: ("complex", 5, "freeform"),
+        GeomAbs_SurfaceOfRevolution: ("moderate", 4, "revolution"),
+        GeomAbs_SurfaceOfExtrusion: ("moderate", 3, "extrusion"),
+        GeomAbs_OffsetSurface: ("complex", 5, "offset"),
+        GeomAbs_OtherSurface: ("complex", 5, "other"),
+    }
+    
+    result = complexity_map.get(surface_type, ("complex", 5, "unknown"))
+    
+    return {
+        "complexity": result[0],
+        "requires_axis": result[1],
+        "curvature_type": result[2]
+    }
+
+
+def surface_type_to_feature_type(surface_type) -> str:
+    """Map OCC surface type to feature type string."""
+    type_map = {
+        GeomAbs_Plane: "planar_surface",
+        GeomAbs_Cylinder: "cylindrical_surface",
+        GeomAbs_Cone: "conical_surface",
+        GeomAbs_Sphere: "spherical_surface",
+        GeomAbs_Torus: "toroidal_surface",
+        GeomAbs_BezierSurface: "freeform_surface",
+        GeomAbs_BSplineSurface: "freeform_surface",
+        GeomAbs_SurfaceOfRevolution: "freeform_surface",
+        GeomAbs_SurfaceOfExtrusion: "freeform_surface",
+        GeomAbs_OffsetSurface: "freeform_surface",
+        GeomAbs_OtherSurface: "freeform_surface",
+    }
+    return type_map.get(surface_type, "freeform_surface")
+
+
+def analyze_face_as_surface(face, face_id: str, adaptor, surface_type, bbox_expanded: dict) -> ExtractedFeature:
+    """
+    Analyze any face as a surface feature with full parameters.
+    
+    This captures ALL machined surfaces including:
+    - Planar (flat) surfaces
+    - Cylindrical surfaces  
+    - Conical surfaces
+    - Spherical surfaces
+    - Toroidal surfaces
+    - Freeform/NURBS surfaces
+    """
+    try:
+        # Get surface area
+        props = GProp_GProps()
+        brepgprop.SurfaceProperties(face, props)
+        area = props.Mass()
+        
+        # Get centroid
+        centroid = get_face_centroid(face)
+        
+        # Get orientation/normal
+        orientation = get_surface_orientation(face, adaptor)
+        
+        # Get curvature complexity
+        curvature = get_curvature_complexity(adaptor, surface_type)
+        
+        # Check if stock face
+        is_stock, stock_boundary = is_stock_face(face, bbox_expanded)
+        
+        # Determine feature type
+        feature_type = surface_type_to_feature_type(surface_type)
+        
+        # Surface-specific parameters
+        params = {
+            "area": round(area, 2),
+            "orientation": orientation["orientation"],
+            "angle_from_vertical": orientation["angle_from_z"],
+            "normal": orientation["normal"],
+            "curvature_complexity": curvature["complexity"],
+            "curvature_type": curvature["curvature_type"],
+            "requires_axis_count": curvature["requires_axis"],
+            "isStockFace": is_stock,
+        }
+        
+        if is_stock:
+            params["stockBoundary"] = stock_boundary
+        
+        # Add geometry-specific parameters
+        if surface_type == GeomAbs_Cylinder:
+            cylinder = adaptor.Cylinder()
+            params["radius"] = round(cylinder.Radius(), 2)
+        elif surface_type == GeomAbs_Cone:
+            cone = adaptor.Cone()
+            params["semi_angle"] = round(abs(cone.SemiAngle()) * 57.2958, 1)  # degrees
+            params["ref_radius"] = round(cone.RefRadius(), 2)
+        elif surface_type == GeomAbs_Sphere:
+            sphere = adaptor.Sphere()
+            params["radius"] = round(sphere.Radius(), 2)
+        elif surface_type == GeomAbs_Torus:
+            torus = adaptor.Torus()
+            params["major_radius"] = round(torus.MajorRadius(), 2)
+            params["minor_radius"] = round(torus.MinorRadius(), 2)
+        
+        # Confidence based on surface simplicity
+        confidence_map = {"simple": 0.95, "moderate": 0.85, "complex": 0.75}
+        confidence = confidence_map.get(curvature["complexity"], 0.75)
+        
+        return ExtractedFeature(
+            type=feature_type,
+            parameters=params,
+            location=centroid,
+            id=str(uuid.uuid4()),
+            metadata=FeatureMetadata(
+                faceIds=[face_id],
+                confidence=confidence,
+                detectionMethod="surface_analysis_v1.7"
+            )
+        )
+        
+    except Exception as e:
+        print(f"Error analyzing face as surface {face_id}: {e}")
+        return None
 
 
 def check_face_concavity(face, shape) -> Tuple[bool, float]:
@@ -1026,12 +1269,26 @@ def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
 
 
 
-def extract_features(shape) -> list:
+def extract_features(shape, include_surfaces: bool = True) -> list:
     """
     Extract all features from the shape using enhanced detection.
-    Uses improved pocket detection with concavity, wall, and depth analysis.
+    
+    v1.7.0: Now detects ALL surfaces as features, with stock face tagging.
+    
+    Feature types detected:
+    - Manufacturing features: hole, boss, pocket, slot, fillet, chamfer, thread
+    - Surface features: planar_surface, cylindrical_surface, conical_surface,
+                        spherical_surface, toroidal_surface, freeform_surface
+    
+    Args:
+        shape: The TopoDS_Shape to analyze
+        include_surfaces: If True, detect all surfaces as features (default: True)
+        
+    Returns:
+        list of ExtractedFeature
     """
-    features = []
+    manufacturing_features = []
+    surface_features = []
     
     # Pre-compute total surface area for relative area calculations
     props = GProp_GProps()
@@ -1041,8 +1298,12 @@ def extract_features(shape) -> list:
     # Build edge-face adjacency map for wall detection
     edge_face_map = build_face_adjacency_map(shape)
     
-    # Collect all planar faces for enhanced pocket detection
+    # Get bounding box for stock face detection
+    bbox_expanded = get_shape_bounding_box_expanded(shape)
+    
+    # Collect faces for various detection passes
     planar_faces = []
+    all_faces = []
     
     face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
     face_index = 0
@@ -1055,29 +1316,65 @@ def extract_features(shape) -> list:
         adaptor = BRepAdaptor_Surface(face)
         surface_type = adaptor.GetType()
         
+        # Store all faces for surface detection
+        all_faces.append((face, face_id, adaptor, surface_type))
+        
         if surface_type == GeomAbs_Plane:
             # Store planar faces for enhanced pocket detection
             planar_faces.append((face, face_id))
         else:
-            # Use standard detection for non-planar faces
+            # Use standard detection for non-planar faces (holes, bosses, fillets, chamfers)
             feature = analyze_face_for_feature(face, face_id)
             if feature:
-                features.append(feature)
+                manufacturing_features.append(feature)
         
         face_explorer.Next()
         face_index += 1
     
     # Enhanced pocket detection for planar faces
+    detected_pocket_face_ids = set()
     for face, face_id in planar_faces:
         pocket_feature = analyze_planar_face_for_pocket(
             face, face_id, shape, total_surface_area, edge_face_map
         )
         if pocket_feature:
-            features.append(pocket_feature)
+            manufacturing_features.append(pocket_feature)
+            detected_pocket_face_ids.add(face_id)
     
-    # Consolidate similar features (e.g., multiple hole faces -> one hole with count)
-    consolidated = consolidate_features(features)
-    return consolidated
+    # Collect face IDs already detected as manufacturing features
+    detected_manufacturing_face_ids = set()
+    for feat in manufacturing_features:
+        if feat.metadata and feat.metadata.faceIds:
+            detected_manufacturing_face_ids.update(feat.metadata.faceIds)
+    detected_manufacturing_face_ids.update(detected_pocket_face_ids)
+    
+    # Surface detection for ALL faces (v1.7.0)
+    if include_surfaces:
+        print(f"[SURFACE DETECTION] Analyzing {len(all_faces)} faces for surface features")
+        
+        for face, face_id, adaptor, surface_type in all_faces:
+            # Skip faces already detected as manufacturing features
+            if face_id in detected_manufacturing_face_ids:
+                continue
+            
+            # Detect as surface feature
+            surface_feature = analyze_face_as_surface(
+                face, face_id, adaptor, surface_type, bbox_expanded
+            )
+            if surface_feature:
+                surface_features.append(surface_feature)
+        
+        print(f"[SURFACE DETECTION] Found {len(surface_features)} surface features")
+    
+    # Combine all features
+    all_features = manufacturing_features + surface_features
+    
+    # Consolidate similar manufacturing features (e.g., multiple hole faces -> one hole with count)
+    # Don't consolidate surfaces - each surface should be reported individually
+    consolidated_mfg = consolidate_features(manufacturing_features)
+    
+    # Return manufacturing features (consolidated) + surface features (individual)
+    return consolidated_mfg + surface_features
 
 
 def consolidate_features(features: list) -> list:
@@ -1216,6 +1513,16 @@ async def get_version():
         "supportedFormats": get_supported_extensions(),
         "freecadAvailable": FREECAD_AVAILABLE,
         "changelog": [
+            {"version": "1.7.0", "date": "2026-01-05", "changes": [
+                "Added comprehensive surface detection for ALL faces",
+                "New surface types: planar_surface, cylindrical_surface, conical_surface, spherical_surface, toroidal_surface, freeform_surface",
+                "Stock face detection with boundary tagging (top, bottom, front, back, left, right)",
+                "Surface parameters: area, orientation, normal, curvature complexity, axis requirements"
+            ]},
+            {"version": "1.6.1", "date": "2026-01-05", "changes": ["Fixed TopExp import for pythonOCC 7.7.0 compatibility"]},
+            {"version": "1.6.0", "date": "2026-01-05", "changes": ["Revised pocket criteria with slot classification"]},
+            {"version": "1.5.0", "date": "2026-01-05", "changes": ["Improved pocket detection with concavity, wall, depth analysis"]},
+            {"version": "1.4.1", "date": "2026-01-05", "changes": ["Enhanced headless FreeCAD support with xvfb"]},
             {"version": "1.4.0", "date": "2026-01-05", "changes": [
                 "Added FreeCAD integration for SolidWorks file support",
                 "SLDPRT and SLDASM files now auto-convert to STEP",
