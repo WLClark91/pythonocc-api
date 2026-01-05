@@ -9,8 +9,10 @@
 # v1.3.0 (2025-01-05) - Added version endpoint and version tracking
 # v1.4.0 (2026-01-05) - Added FreeCAD integration for SolidWorks (SLDPRT/SLDASM) file support
 # v1.4.1 (2026-01-05) - Enhanced headless FreeCAD support with xvfb, improved error handling
+# v1.5.0 (2026-01-05) - Improved pocket detection with concavity, wall, depth, and boundary analysis
+# v1.6.0 (2026-01-05) - Revised pocket criteria: edge-sharing walls (no count), 0.01mm depth, slot classification
 
-API_VERSION = "1.4.1"
+API_VERSION = "1.6.0"
 API_VERSION_DATE = "2026-01-05"
 
 import base64
@@ -30,7 +32,9 @@ from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_REVERSED
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_REVERSED, TopAbs_WIRE
+from OCC.Core.TopExp import TopExp
+from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.BRepGProp import brepgprop
@@ -44,7 +48,9 @@ from OCC.Core.GeomAbs import (
 )
 from OCC.Core.gp import gp_Pnt, gp_Vec
 from OCC.Core.BRepLProp import BRepLProp_SLProps
-from OCC.Core.BRepTools import breptools
+from OCC.Core.BRepTools import breptools, BRepTools_WireExplorer
+from OCC.Core.ShapeAnalysis import ShapeAnalysis_Surface
+from OCC.Core.TopoDS import topods
 
 app = FastAPI(title="PythonOCC STEP Analyzer API")
 
@@ -554,8 +560,389 @@ def is_cylindrical_face_a_boss(face, adaptor) -> tuple:
         return (False, 0.5, "error")
 
 
+# =============================================================================
+# ENHANCED POCKET DETECTION HELPERS
+# =============================================================================
+
+def get_shape_center(shape) -> gp_Pnt:
+    """Get the center point of the shape's bounding box."""
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    return gp_Pnt((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+
+
+def check_face_concavity(face, shape) -> Tuple[bool, float]:
+    """
+    Check if a planar face is concave (material removed) by comparing 
+    face normal direction to the vector toward shape center.
+    
+    A face is considered concave (pocket floor) if its normal points 
+    AWAY from the shape's center (indicating an internal cavity).
+    
+    Returns:
+        tuple: (is_concave: bool, confidence: float)
+    """
+    try:
+        adaptor = BRepAdaptor_Surface(face)
+        
+        # Get face centroid
+        face_center = get_face_centroid(face)
+        face_pnt = gp_Pnt(face_center.x, face_center.y, face_center.z)
+        
+        # Get shape center
+        shape_center = get_shape_center(shape)
+        
+        # Vector from face center to shape center
+        to_center = gp_Vec(face_pnt, shape_center)
+        if to_center.Magnitude() < 1e-10:
+            return (False, 0.3)
+        to_center.Normalize()
+        
+        # Get face normal at centroid
+        u_min, u_max, v_min, v_max = breptools.UVBounds(face)
+        u_mid = (u_min + u_max) / 2.0
+        v_mid = (v_min + v_max) / 2.0
+        
+        props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 1, 1e-6)
+        if not props.IsNormalDefined():
+            return (False, 0.3)
+        
+        normal = props.Normal()
+        
+        # Account for face orientation
+        if face.Orientation() == TopAbs_REVERSED:
+            normal.Reverse()
+        
+        normal_vec = gp_Vec(normal.X(), normal.Y(), normal.Z())
+        
+        # Dot product: positive means normal points toward center (external face)
+        # Negative means normal points away from center (concave/pocket floor)
+        dot_product = normal_vec.Dot(to_center)
+        
+        is_concave = dot_product < -0.1  # Threshold to avoid edge cases
+        
+        # Confidence based on how clearly it points away
+        confidence = min(0.95, 0.5 + abs(dot_product) * 0.45) if is_concave else 0.3
+        
+        return (is_concave, confidence)
+        
+    except Exception as e:
+        print(f"Error checking face concavity: {e}")
+        return (False, 0.3)
+
+
+def build_face_adjacency_map(shape) -> TopTools_IndexedDataMapOfShapeListOfShape:
+    """Build a map of edges to their adjacent faces for topology analysis."""
+    edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_face_map)
+    return edge_face_map
+
+
+def find_adjacent_enclosing_walls(face, shape, edge_face_map) -> list:
+    """
+    Find faces that share edges with this face and are roughly vertical
+    (potential pocket walls). Includes both planar and curved (e.g., cylindrical) walls.
+    
+    A wall face has a normal that is roughly perpendicular to the floor normal
+    (dot product close to 0). The count of walls does not matter - a circular
+    pocket has 1 curved wall, a rectangular pocket has 4 planar walls.
+    
+    Returns:
+        list: List of dicts with adjacent wall face info (edge-sharing walls)
+    """
+    adjacent_walls = []
+    
+    try:
+        # Get floor face normal
+        floor_adaptor = BRepAdaptor_Surface(face)
+        u_min, u_max, v_min, v_max = breptools.UVBounds(face)
+        u_mid, v_mid = (u_min + u_max) / 2.0, (v_min + v_max) / 2.0
+        
+        floor_props = BRepLProp_SLProps(floor_adaptor, u_mid, v_mid, 1, 1e-6)
+        if not floor_props.IsNormalDefined():
+            return adjacent_walls
+        
+        floor_normal = floor_props.Normal()
+        if face.Orientation() == TopAbs_REVERSED:
+            floor_normal.Reverse()
+        floor_normal_vec = gp_Vec(floor_normal.X(), floor_normal.Y(), floor_normal.Z())
+        
+        # Explore edges of this face
+        edge_explorer = TopExp_Explorer(face, TopAbs_EDGE)
+        seen_faces = set()
+        wall_index = 0
+        
+        while edge_explorer.More():
+            edge = edge_explorer.Current()
+            
+            # Find faces sharing this edge
+            edge_index = edge_face_map.FindIndex(edge)
+            if edge_index > 0:
+                adjacent_face_list = edge_face_map.FindFromIndex(edge_index)
+                
+                for i in range(adjacent_face_list.Size()):
+                    adj_face = adjacent_face_list.Value(i + 1)  # 1-indexed
+                    
+                    # Skip if it's the same face or already processed
+                    face_hash = adj_face.__hash__()
+                    if adj_face.IsSame(face) or face_hash in seen_faces:
+                        continue
+                    seen_faces.add(face_hash)
+                    
+                    # Check adjacent face type (planar or cylindrical walls are valid)
+                    adj_adaptor = BRepAdaptor_Surface(topods.Face(adj_face))
+                    adj_surface_type = adj_adaptor.GetType()
+                    
+                    # Accept planar walls and cylindrical walls (for circular pockets)
+                    is_planar_wall = adj_surface_type == GeomAbs_Plane
+                    is_curved_wall = adj_surface_type == GeomAbs_Cylinder
+                    
+                    if not (is_planar_wall or is_curved_wall):
+                        continue
+                    
+                    # Get adjacent face normal
+                    au_min, au_max, av_min, av_max = breptools.UVBounds(topods.Face(adj_face))
+                    au_mid, av_mid = (au_min + au_max) / 2.0, (av_min + av_max) / 2.0
+                    
+                    adj_props = BRepLProp_SLProps(adj_adaptor, au_mid, av_mid, 1, 1e-6)
+                    if not adj_props.IsNormalDefined():
+                        continue
+                    
+                    adj_normal = adj_props.Normal()
+                    if adj_face.Orientation() == TopAbs_REVERSED:
+                        adj_normal.Reverse()
+                    adj_normal_vec = gp_Vec(adj_normal.X(), adj_normal.Y(), adj_normal.Z())
+                    
+                    # Check if roughly perpendicular to floor (wall)
+                    dot = abs(floor_normal_vec.Dot(adj_normal_vec))
+                    if dot < 0.3:  # Nearly perpendicular
+                        # Get wall face properties
+                        wall_props = GProp_GProps()
+                        brepgprop.SurfaceProperties(adj_face, wall_props)
+                        wall_area = wall_props.Mass()
+                        wall_center = wall_props.CentreOfMass()
+                        
+                        wall_type = "curved" if is_curved_wall else "planar"
+                        
+                        adjacent_walls.append({
+                            "id": f"wall_{wall_index}",
+                            "area": wall_area,
+                            "center_z": wall_center.Z(),
+                            "max_z": get_face_max_z(topods.Face(adj_face)),
+                            "wall_type": wall_type
+                        })
+                        wall_index += 1
+            
+            edge_explorer.Next()
+        
+    except Exception as e:
+        print(f"Error finding adjacent walls: {e}")
+    
+    return adjacent_walls
+
+
+def get_face_max_z(face) -> float:
+    """Get the maximum Z coordinate of a face's vertices."""
+    max_z = float('-inf')
+    
+    try:
+        vertex_explorer = TopExp_Explorer(face, TopAbs_EDGE)
+        while vertex_explorer.More():
+            edge = vertex_explorer.Current()
+            curve_adaptor = BRepAdaptor_Curve(edge)
+            
+            # Sample points along edge
+            u_min = curve_adaptor.FirstParameter()
+            u_max = curve_adaptor.LastParameter()
+            
+            for t in [0.0, 0.5, 1.0]:
+                u = u_min + t * (u_max - u_min)
+                pnt = curve_adaptor.Value(u)
+                max_z = max(max_z, pnt.Z())
+            
+            vertex_explorer.Next()
+    except:
+        pass
+    
+    return max_z if max_z != float('-inf') else 0.0
+
+
+def calculate_pocket_depth(floor_face, wall_faces: list) -> float:
+    """
+    Calculate pocket depth from the highest point of walls to floor centroid Z.
+    
+    Depth = max(wall_max_z) - floor_z
+    """
+    try:
+        if not wall_faces:
+            return 0.0
+        
+        # Get floor Z level
+        floor_center = get_face_centroid(floor_face)
+        floor_z = floor_center.z
+        
+        # Get maximum Z from wall faces
+        max_wall_z = max(w.get("max_z", floor_z) for w in wall_faces)
+        
+        depth = max_wall_z - floor_z
+        return max(0.0, depth)
+        
+    except Exception as e:
+        print(f"Error calculating pocket depth: {e}")
+        return 0.0
+
+
+def check_closed_boundary(face) -> bool:
+    """
+    Check if the face's outer wire forms a closed loop.
+    A closed pocket has all edges connected in a continuous loop.
+    """
+    try:
+        outer_wire = breptools.OuterWire(face)
+        if outer_wire.IsNull():
+            return False
+        
+        # Check if wire is closed by exploring edges
+        wire_explorer = BRepTools_WireExplorer(outer_wire)
+        edge_count = 0
+        
+        while wire_explorer.More():
+            edge_count += 1
+            wire_explorer.Next()
+        
+        # A closed wire needs at least 3 edges (triangle) or 4 for rectangle
+        return edge_count >= 3
+        
+    except Exception as e:
+        print(f"Error checking boundary: {e}")
+        return False
+
+
+def analyze_planar_face_for_pocket(face, face_id: str, shape, total_surface_area: float, edge_face_map) -> Optional[ExtractedFeature]:
+    """
+    Enhanced pocket/slot detection with strict qualifying criteria.
+    
+    QUALIFYING CRITERIA (must ALL pass, or feature is rejected):
+    1. Concavity - face normal points away from shape center (material removed)
+    2. Enclosing Walls - has wall(s) sharing edges (count doesn't matter: 1 curved or N planar)
+    3. Measurable Depth - depth > 0.01mm (epsilon to filter numerical noise)
+    4. Closed Boundary - if fails, feature becomes "slot" instead of "pocket"
+    
+    SUPPORTING CRITERIA (boosts confidence, doesn't disqualify):
+    - Relative Area < 15% of total surface
+    
+    Returns pocket, slot, or None (rejected).
+    """
+    DEPTH_EPSILON = 0.01  # mm - filters floating-point noise while catching shallow pockets
+    
+    try:
+        props = GProp_GProps()
+        brepgprop.SurfaceProperties(face, props)
+        area = props.Mass()
+        
+        # Skip very tiny faces (likely numerical artifacts)
+        if area < 1.0:  # Less than 1 mm²
+            print(f"  [REJECT] {face_id}: Area too small ({area:.2f} mm²)")
+            return None
+        
+        # =================================================================
+        # QUALIFYING CRITERION 1: CONCAVITY (must pass)
+        # Face should be concave (material removed, normal points away)
+        # =================================================================
+        is_concave, concavity_confidence = check_face_concavity(face, shape)
+        if not is_concave:
+            print(f"  [REJECT] {face_id}: Failed concavity check (external face)")
+            return None
+        
+        # =================================================================
+        # QUALIFYING CRITERION 2: ENCLOSING WALLS (must pass)
+        # Must have at least 1 wall sharing edges (planar or curved)
+        # =================================================================
+        adjacent_walls = find_adjacent_enclosing_walls(face, shape, edge_face_map)
+        wall_count = len(adjacent_walls)
+        has_enclosing_walls = wall_count >= 1
+        
+        if not has_enclosing_walls:
+            print(f"  [REJECT] {face_id}: No enclosing walls found")
+            return None
+        
+        # =================================================================
+        # QUALIFYING CRITERION 3: MEASURABLE DEPTH (must pass)
+        # Depth must be > epsilon (0.01mm) to filter numerical noise
+        # =================================================================
+        depth = calculate_pocket_depth(face, adjacent_walls)
+        has_meaningful_depth = depth > DEPTH_EPSILON
+        
+        if not has_meaningful_depth:
+            print(f"  [REJECT] {face_id}: Depth too shallow ({depth:.4f}mm < {DEPTH_EPSILON}mm)")
+            return None
+        
+        # =================================================================
+        # QUALIFYING CRITERION 4: CLOSED BOUNDARY
+        # If fails, classify as "slot" instead of "pocket"
+        # =================================================================
+        is_closed = check_closed_boundary(face)
+        
+        # Determine feature type based on boundary closure
+        if is_closed:
+            feature_type = "pocket"
+            pocket_type = "closed"
+        else:
+            feature_type = "slot"
+            pocket_type = "open"
+            print(f"  [SLOT] {face_id}: Open boundary - classifying as slot")
+        
+        # =================================================================
+        # SUPPORTING CRITERION: RELATIVE AREA (boosts confidence)
+        # Pocket/slot floors are typically < 15% of total surface
+        # =================================================================
+        relative_area = area / total_surface_area if total_surface_area > 0 else 0
+        is_small_relative = relative_area < 0.15
+        
+        # =================================================================
+        # CONFIDENCE CALCULATION
+        # =================================================================
+        confidence = 0.50  # Base confidence (passed all qualifying criteria)
+        confidence += 0.20 * concavity_confidence  # Concavity strength
+        confidence += 0.10 if wall_count >= 2 else 0.05  # More walls = higher confidence
+        confidence += 0.10 if is_small_relative else 0.0  # Supporting: relative area
+        confidence += 0.05 if depth > 1.0 else 0.0  # Deeper = more confident
+        
+        # Determine wall type for metadata
+        wall_types = list(set(w.get("wall_type", "planar") for w in adjacent_walls))
+        
+        print(f"  [DETECTED] {face_id}: {feature_type} (depth={depth:.2f}mm, walls={wall_count}, closed={is_closed})")
+        
+        return ExtractedFeature(
+            type=feature_type,
+            parameters={
+                "depth": round(depth, 2),
+                "area": round(area, 2),
+                "wall_count": wall_count,
+                "wall_types": wall_types,
+                "is_closed": is_closed,
+                "pocket_type": pocket_type
+            },
+            location=get_face_centroid(face),
+            id=str(uuid.uuid4()),
+            metadata=FeatureMetadata(
+                faceIds=[face_id] + [w["id"] for w in adjacent_walls],
+                confidence=round(min(0.95, confidence), 2),
+                detectionMethod="strict_qualifying_criteria_v1.6"
+            )
+        )
+        
+    except Exception as e:
+        print(f"Error in pocket/slot analysis for {face_id}: {e}")
+        return None
+
+
 def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
-    """Analyze a single face to detect if it's part of a feature."""
+    """
+    Analyze a single face to detect if it's part of a feature.
+    Note: Pocket detection is handled separately in extract_features using enhanced logic.
+    """
     try:
         adaptor = BRepAdaptor_Surface(face)
         surface_type = adaptor.GetType()
@@ -627,27 +1014,8 @@ def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
                 )
             )
         
-        # Planar faces could be pockets or slots (need more context)
-        elif surface_type == GeomAbs_Plane:
-            # Only flag as pocket if it's an internal planar face
-            # This is a simplified heuristic
-            props = GProp_GProps()
-            brepgprop.SurfaceProperties(face, props)
-            area = props.Mass()
-            
-            # Small planar faces might be pocket bottoms
-            if area < 1000:  # Threshold in mm²
-                return ExtractedFeature(
-                    type="pocket",
-                    parameters={"depth": 5.0, "area": area},  # Depth is estimated
-                    location=get_face_centroid(face),
-                    id=str(uuid.uuid4()),
-                    metadata=FeatureMetadata(
-                        faceIds=[face_id],
-                        confidence=0.60,
-                        detectionMethod="planar_face"
-                    )
-                )
+        # Planar faces are handled by enhanced pocket detection in extract_features
+        # Skip here to avoid duplicate/low-confidence detection
         
         return None
         
@@ -656,22 +1024,55 @@ def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
         return None
 
 
+
 def extract_features(shape) -> list:
-    """Extract all features from the shape."""
+    """
+    Extract all features from the shape using enhanced detection.
+    Uses improved pocket detection with concavity, wall, and depth analysis.
+    """
     features = []
+    
+    # Pre-compute total surface area for relative area calculations
+    props = GProp_GProps()
+    brepgprop.SurfaceProperties(shape, props)
+    total_surface_area = props.Mass()
+    
+    # Build edge-face adjacency map for wall detection
+    edge_face_map = build_face_adjacency_map(shape)
+    
+    # Collect all planar faces for enhanced pocket detection
+    planar_faces = []
+    
     face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
     face_index = 0
     
     while face_explorer.More():
-        face = face_explorer.Current()
+        face = topods.Face(face_explorer.Current())
         face_id = f"face_{face_index}"
         
-        feature = analyze_face_for_feature(face, face_id)
-        if feature:
-            features.append(feature)
+        # Check surface type
+        adaptor = BRepAdaptor_Surface(face)
+        surface_type = adaptor.GetType()
+        
+        if surface_type == GeomAbs_Plane:
+            # Store planar faces for enhanced pocket detection
+            planar_faces.append((face, face_id))
+        else:
+            # Use standard detection for non-planar faces
+            feature = analyze_face_for_feature(face, face_id)
+            if feature:
+                features.append(feature)
         
         face_explorer.Next()
         face_index += 1
+    
+    # Enhanced pocket detection for planar faces
+    for face, face_id in planar_faces:
+        pocket_feature = analyze_planar_face_for_pocket(
+            face, face_id, shape, total_surface_area, edge_face_map
+        )
+        if pocket_feature:
+            features.append(pocket_feature)
     
     # Consolidate similar features (e.g., multiple hole faces -> one hole with count)
     consolidated = consolidate_features(features)
