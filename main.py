@@ -8,8 +8,9 @@
 # v1.2.0 (2025-01-05) - Added mesh generation with triangle-to-feature mapping
 # v1.3.0 (2025-01-05) - Added version endpoint and version tracking
 # v1.4.0 (2026-01-05) - Added FreeCAD integration for SolidWorks (SLDPRT/SLDASM) file support
+# v1.4.1 (2026-01-05) - Enhanced headless FreeCAD support with xvfb, improved error handling
 
-API_VERSION = "1.4.0"
+API_VERSION = "1.4.1"
 API_VERSION_DATE = "2026-01-05"
 
 import base64
@@ -63,49 +64,55 @@ app.add_middleware(
 # Check if FreeCAD is available
 FREECAD_AVAILABLE = False
 FREECAD_PATH = None
+FREECAD_PYTHON_PATH = None
 
 def check_freecad_availability():
     """Check if FreeCAD is installed and available for file conversion."""
-    global FREECAD_AVAILABLE, FREECAD_PATH
+    global FREECAD_AVAILABLE, FREECAD_PATH, FREECAD_PYTHON_PATH
     
-    # Common FreeCAD locations
-    possible_paths = [
-        "/usr/bin/freecad",
+    # First, look for freecadcmd (headless version - preferred)
+    freecadcmd_paths = [
         "/usr/bin/freecadcmd",
-        "/usr/local/bin/freecad",
         "/usr/local/bin/freecadcmd",
-        "/opt/freecad/bin/freecad",
         "/opt/freecad/bin/freecadcmd",
-        # Conda environment
-        os.path.join(os.environ.get("CONDA_PREFIX", ""), "bin", "freecadcmd"),
-        os.path.join(os.environ.get("CONDA_PREFIX", ""), "bin", "freecad"),
+        shutil.which("freecadcmd"),
     ]
     
-    for path in possible_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
+    for path in freecadcmd_paths:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            FREECAD_PATH = path
+            FREECAD_AVAILABLE = True
+            print(f"FreeCAD (headless) found at: {path}")
+            return True
+    
+    # Fallback to regular freecad
+    freecad_paths = [
+        "/usr/bin/freecad",
+        "/usr/local/bin/freecad",
+        "/opt/freecad/bin/freecad",
+        shutil.which("freecad"),
+    ]
+    
+    for path in freecad_paths:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
             FREECAD_PATH = path
             FREECAD_AVAILABLE = True
             print(f"FreeCAD found at: {path}")
             return True
     
-    # Try which command
+    # Check for FreeCAD Python module directly
     try:
-        result = subprocess.run(["which", "freecadcmd"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["python3", "-c", "import FreeCAD; print(FreeCAD.__file__)"],
+            capture_output=True, text=True, timeout=10
+        )
         if result.returncode == 0:
-            FREECAD_PATH = result.stdout.strip()
+            FREECAD_PYTHON_PATH = "python3"
             FREECAD_AVAILABLE = True
-            print(f"FreeCAD found via which: {FREECAD_PATH}")
+            print(f"FreeCAD Python module available via python3")
             return True
     except:
         pass
-    
-    # Try shutil.which
-    freecad_path = shutil.which("freecadcmd") or shutil.which("freecad")
-    if freecad_path:
-        FREECAD_PATH = freecad_path
-        FREECAD_AVAILABLE = True
-        print(f"FreeCAD found via shutil: {FREECAD_PATH}")
-        return True
     
     print("FreeCAD not found - SolidWorks file support will be unavailable")
     return False
@@ -115,54 +122,102 @@ check_freecad_availability()
 
 
 # FreeCAD conversion script (written to temp file for execution)
+# Uses explicit error output to stderr for better capture
 FREECAD_CONVERSION_SCRIPT = '''
 import sys
-import FreeCAD
-import Part
+import os
+
+# Redirect stdout to capture all output
+print(f"FreeCAD conversion starting...", file=sys.stderr)
+print(f"Input: {sys.argv[1]}", file=sys.stderr)
+print(f"Output: {sys.argv[2]}", file=sys.stderr)
+
+try:
+    import FreeCAD
+    print(f"FreeCAD version: {FreeCAD.Version()}", file=sys.stderr)
+except ImportError as e:
+    print(f"IMPORT_ERROR: Cannot import FreeCAD: {e}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import Part
+except ImportError as e:
+    print(f"IMPORT_ERROR: Cannot import Part module: {e}", file=sys.stderr)
+    sys.exit(1)
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
-print(f"Converting: {input_file} -> {output_file}")
-
 try:
+    # Verify input file exists
+    if not os.path.exists(input_file):
+        raise Exception(f"Input file does not exist: {input_file}")
+    
+    file_size = os.path.getsize(input_file)
+    print(f"Input file size: {file_size} bytes", file=sys.stderr)
+    
     # Open the document
+    print("Opening document...", file=sys.stderr)
     doc = FreeCAD.openDocument(input_file)
     
     if doc is None:
-        raise Exception("Failed to open document")
+        raise Exception("FreeCAD returned None when opening document - file format may not be supported")
+    
+    print(f"Document opened: {doc.Name}", file=sys.stderr)
     
     # Get all objects
     objects = doc.Objects
+    print(f"Found {len(objects)} objects in document", file=sys.stderr)
     
     if not objects:
-        raise Exception("No objects found in document")
+        raise Exception("No objects found in document - file may be empty or corrupted")
     
     # Collect all shapes
     shapes = []
-    for obj in objects:
+    for i, obj in enumerate(objects):
+        print(f"Processing object {i}: {obj.Name} (Type: {obj.TypeId})", file=sys.stderr)
         if hasattr(obj, 'Shape') and obj.Shape:
-            shapes.append(obj.Shape)
+            if not obj.Shape.isNull():
+                shapes.append(obj.Shape)
+                print(f"  -> Added shape with {len(obj.Shape.Faces)} faces", file=sys.stderr)
+            else:
+                print(f"  -> Shape is null, skipping", file=sys.stderr)
+        else:
+            print(f"  -> No shape attribute", file=sys.stderr)
     
     if not shapes:
-        raise Exception("No valid shapes found in document")
+        raise Exception("No valid shapes found in document - objects exist but have no geometry")
+    
+    print(f"Collected {len(shapes)} valid shapes", file=sys.stderr)
     
     # Combine shapes into compound if multiple
     if len(shapes) == 1:
         final_shape = shapes[0]
     else:
+        print("Creating compound from multiple shapes...", file=sys.stderr)
         final_shape = Part.makeCompound(shapes)
     
+    print(f"Final shape has {len(final_shape.Faces)} faces", file=sys.stderr)
+    
     # Export to STEP
+    print(f"Exporting to STEP: {output_file}", file=sys.stderr)
     final_shape.exportStep(output_file)
     
-    print(f"Successfully converted to STEP: {output_file}")
+    # Verify output
+    if os.path.exists(output_file):
+        out_size = os.path.getsize(output_file)
+        print(f"SUCCESS: STEP file created ({out_size} bytes)", file=sys.stderr)
+    else:
+        raise Exception("Export completed but output file was not created")
     
     # Close document
     FreeCAD.closeDocument(doc.Name)
+    print("Document closed, conversion complete", file=sys.stderr)
     
 except Exception as e:
-    print(f"ERROR: {str(e)}")
+    import traceback
+    print(f"CONVERSION_ERROR: {str(e)}", file=sys.stderr)
+    print(f"Traceback:\\n{traceback.format_exc()}", file=sys.stderr)
     sys.exit(1)
 '''
 
@@ -192,12 +247,16 @@ def convert_solidworks_to_step(file_content: bytes, original_filename: str) -> b
     if ext not in ['.sldprt', '.sldasm']:
         raise Exception(f"Unsupported file format: {ext}")
     
+    print(f"Starting SolidWorks conversion for: {original_filename} ({len(file_content)} bytes)")
+    
     # Create temporary files
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write input file
         input_path = os.path.join(tmpdir, f"input{ext}")
         with open(input_path, 'wb') as f:
             f.write(file_content)
+        
+        print(f"Wrote input file to: {input_path}")
         
         # Output STEP file
         output_path = os.path.join(tmpdir, "output.step")
@@ -207,43 +266,78 @@ def convert_solidworks_to_step(file_content: bytes, original_filename: str) -> b
         with open(script_path, 'w') as f:
             f.write(FREECAD_CONVERSION_SCRIPT)
         
+        # Build command based on what's available
+        if FREECAD_PATH:
+            # Use FreeCAD executable with script
+            cmd = [FREECAD_PATH, "-c", script_path, input_path, output_path]
+        elif FREECAD_PYTHON_PATH:
+            # Use Python with FreeCAD module
+            cmd = [FREECAD_PYTHON_PATH, script_path, input_path, output_path]
+        else:
+            raise Exception("No FreeCAD execution method available")
+        
+        # Set up environment for headless operation
+        env = os.environ.copy()
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['DISPLAY'] = os.environ.get('DISPLAY', ':99')
+        
+        print(f"Running FreeCAD conversion: {' '.join(cmd)}")
+        print(f"Environment: QT_QPA_PLATFORM={env.get('QT_QPA_PLATFORM')}, DISPLAY={env.get('DISPLAY')}")
+        
         # Run FreeCAD conversion
         try:
-            # Use freecadcmd for headless operation
-            cmd = [FREECAD_PATH, script_path, input_path, output_path]
-            
-            print(f"Running FreeCAD conversion: {' '.join(cmd)}")
-            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120  # 2 minute timeout for large assemblies
+                timeout=180,  # 3 minute timeout for large assemblies
+                env=env
             )
             
-            print(f"FreeCAD stdout: {result.stdout}")
+            # Log all output for debugging
+            all_output = []
+            if result.stdout:
+                print(f"FreeCAD stdout:\n{result.stdout}")
+                all_output.append(f"stdout: {result.stdout}")
             if result.stderr:
-                print(f"FreeCAD stderr: {result.stderr}")
+                print(f"FreeCAD stderr:\n{result.stderr}")
+                all_output.append(f"stderr: {result.stderr}")
+            
+            print(f"FreeCAD exit code: {result.returncode}")
+            
+            # Check for specific error patterns
+            combined_output = (result.stdout or "") + (result.stderr or "")
+            
+            if "IMPORT_ERROR" in combined_output:
+                raise Exception(f"FreeCAD module import failed. Check FreeCAD installation. Details: {combined_output}")
+            
+            if "CONVERSION_ERROR" in combined_output:
+                # Extract the specific error message
+                error_lines = [l for l in combined_output.split('\n') if 'CONVERSION_ERROR' in l or 'Traceback' in l]
+                raise Exception(f"FreeCAD conversion failed: {' '.join(error_lines) or combined_output}")
             
             if result.returncode != 0:
-                raise Exception(f"FreeCAD conversion failed: {result.stderr or result.stdout}")
+                error_msg = result.stderr or result.stdout or "Unknown error (no output captured)"
+                raise Exception(f"FreeCAD process exited with code {result.returncode}: {error_msg}")
             
             # Read the converted STEP file
             if not os.path.exists(output_path):
-                raise Exception("FreeCAD did not produce output file")
+                raise Exception(f"FreeCAD completed but output file not found. Output: {combined_output}")
             
             with open(output_path, 'rb') as f:
                 step_content = f.read()
             
             if len(step_content) < 100:
-                raise Exception("FreeCAD produced an empty or invalid STEP file")
+                raise Exception(f"FreeCAD produced an empty or invalid STEP file ({len(step_content)} bytes)")
             
             print(f"Successfully converted {original_filename} to STEP ({len(step_content)} bytes)")
             return step_content
             
         except subprocess.TimeoutExpired:
-            raise Exception("FreeCAD conversion timed out (>120 seconds). File may be too complex.")
+            raise Exception("FreeCAD conversion timed out (>180 seconds). File may be too complex or FreeCAD may be hanging.")
         except Exception as e:
+            if "FreeCAD" in str(e):
+                raise  # Re-raise our detailed exceptions
             raise Exception(f"FreeCAD conversion error: {str(e)}")
 
 
