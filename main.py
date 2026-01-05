@@ -1,12 +1,25 @@
 # main.py - Complete pythonOCC API for STEP file analysis with mesh generation
 # Updated with proper hole vs boss detection based on surface normal direction
+# Now includes FreeCAD integration for SolidWorks file conversion
+# 
+# VERSION HISTORY:
+# v1.0.0 (2025-01-05) - Initial release with basic STEP analysis
+# v1.1.0 (2025-01-05) - Added hole vs boss detection using surface normal analysis
+# v1.2.0 (2025-01-05) - Added mesh generation with triangle-to-feature mapping
+# v1.3.0 (2025-01-05) - Added version endpoint and version tracking
+# v1.4.0 (2026-01-05) - Added FreeCAD integration for SolidWorks (SLDPRT/SLDASM) file support
+
+API_VERSION = "1.4.0"
+API_VERSION_DATE = "2026-01-05"
 
 import base64
 import io
 import tempfile
 import os
 import uuid
-from typing import Optional
+import subprocess
+import shutil
+from typing import Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -43,7 +56,215 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request/Response models
+# =============================================================================
+# FREECAD INTEGRATION FOR SOLIDWORKS FILE CONVERSION
+# =============================================================================
+
+# Check if FreeCAD is available
+FREECAD_AVAILABLE = False
+FREECAD_PATH = None
+
+def check_freecad_availability():
+    """Check if FreeCAD is installed and available for file conversion."""
+    global FREECAD_AVAILABLE, FREECAD_PATH
+    
+    # Common FreeCAD locations
+    possible_paths = [
+        "/usr/bin/freecad",
+        "/usr/bin/freecadcmd",
+        "/usr/local/bin/freecad",
+        "/usr/local/bin/freecadcmd",
+        "/opt/freecad/bin/freecad",
+        "/opt/freecad/bin/freecadcmd",
+        # Conda environment
+        os.path.join(os.environ.get("CONDA_PREFIX", ""), "bin", "freecadcmd"),
+        os.path.join(os.environ.get("CONDA_PREFIX", ""), "bin", "freecad"),
+    ]
+    
+    for path in possible_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            FREECAD_PATH = path
+            FREECAD_AVAILABLE = True
+            print(f"FreeCAD found at: {path}")
+            return True
+    
+    # Try which command
+    try:
+        result = subprocess.run(["which", "freecadcmd"], capture_output=True, text=True)
+        if result.returncode == 0:
+            FREECAD_PATH = result.stdout.strip()
+            FREECAD_AVAILABLE = True
+            print(f"FreeCAD found via which: {FREECAD_PATH}")
+            return True
+    except:
+        pass
+    
+    # Try shutil.which
+    freecad_path = shutil.which("freecadcmd") or shutil.which("freecad")
+    if freecad_path:
+        FREECAD_PATH = freecad_path
+        FREECAD_AVAILABLE = True
+        print(f"FreeCAD found via shutil: {FREECAD_PATH}")
+        return True
+    
+    print("FreeCAD not found - SolidWorks file support will be unavailable")
+    return False
+
+# Check FreeCAD on startup
+check_freecad_availability()
+
+
+# FreeCAD conversion script (written to temp file for execution)
+FREECAD_CONVERSION_SCRIPT = '''
+import sys
+import FreeCAD
+import Part
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+
+print(f"Converting: {input_file} -> {output_file}")
+
+try:
+    # Open the document
+    doc = FreeCAD.openDocument(input_file)
+    
+    if doc is None:
+        raise Exception("Failed to open document")
+    
+    # Get all objects
+    objects = doc.Objects
+    
+    if not objects:
+        raise Exception("No objects found in document")
+    
+    # Collect all shapes
+    shapes = []
+    for obj in objects:
+        if hasattr(obj, 'Shape') and obj.Shape:
+            shapes.append(obj.Shape)
+    
+    if not shapes:
+        raise Exception("No valid shapes found in document")
+    
+    # Combine shapes into compound if multiple
+    if len(shapes) == 1:
+        final_shape = shapes[0]
+    else:
+        final_shape = Part.makeCompound(shapes)
+    
+    # Export to STEP
+    final_shape.exportStep(output_file)
+    
+    print(f"Successfully converted to STEP: {output_file}")
+    
+    # Close document
+    FreeCAD.closeDocument(doc.Name)
+    
+except Exception as e:
+    print(f"ERROR: {str(e)}")
+    sys.exit(1)
+'''
+
+
+def convert_solidworks_to_step(file_content: bytes, original_filename: str) -> bytes:
+    """
+    Convert a SolidWorks file (SLDPRT/SLDASM) to STEP format using FreeCAD.
+    
+    Args:
+        file_content: The binary content of the SolidWorks file
+        original_filename: Original filename to determine file type
+        
+    Returns:
+        bytes: The converted STEP file content
+        
+    Raises:
+        Exception: If conversion fails or FreeCAD is not available
+    """
+    if not FREECAD_AVAILABLE:
+        raise Exception(
+            "FreeCAD is not installed. SolidWorks file conversion is not available. "
+            "Please install FreeCAD or convert your file to STEP format manually."
+        )
+    
+    # Determine file extension
+    ext = os.path.splitext(original_filename.lower())[1]
+    if ext not in ['.sldprt', '.sldasm']:
+        raise Exception(f"Unsupported file format: {ext}")
+    
+    # Create temporary files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write input file
+        input_path = os.path.join(tmpdir, f"input{ext}")
+        with open(input_path, 'wb') as f:
+            f.write(file_content)
+        
+        # Output STEP file
+        output_path = os.path.join(tmpdir, "output.step")
+        
+        # Write conversion script
+        script_path = os.path.join(tmpdir, "convert.py")
+        with open(script_path, 'w') as f:
+            f.write(FREECAD_CONVERSION_SCRIPT)
+        
+        # Run FreeCAD conversion
+        try:
+            # Use freecadcmd for headless operation
+            cmd = [FREECAD_PATH, script_path, input_path, output_path]
+            
+            print(f"Running FreeCAD conversion: {' '.join(cmd)}")
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120  # 2 minute timeout for large assemblies
+            )
+            
+            print(f"FreeCAD stdout: {result.stdout}")
+            if result.stderr:
+                print(f"FreeCAD stderr: {result.stderr}")
+            
+            if result.returncode != 0:
+                raise Exception(f"FreeCAD conversion failed: {result.stderr or result.stdout}")
+            
+            # Read the converted STEP file
+            if not os.path.exists(output_path):
+                raise Exception("FreeCAD did not produce output file")
+            
+            with open(output_path, 'rb') as f:
+                step_content = f.read()
+            
+            if len(step_content) < 100:
+                raise Exception("FreeCAD produced an empty or invalid STEP file")
+            
+            print(f"Successfully converted {original_filename} to STEP ({len(step_content)} bytes)")
+            return step_content
+            
+        except subprocess.TimeoutExpired:
+            raise Exception("FreeCAD conversion timed out (>120 seconds). File may be too complex.")
+        except Exception as e:
+            raise Exception(f"FreeCAD conversion error: {str(e)}")
+
+
+def get_supported_extensions() -> list:
+    """Get list of supported file extensions."""
+    extensions = [".step", ".stp"]
+    if FREECAD_AVAILABLE:
+        extensions.extend([".sldprt", ".sldasm"])
+    return extensions
+
+
+def is_solidworks_file(filename: str) -> bool:
+    """Check if the file is a SolidWorks format."""
+    ext = os.path.splitext(filename.lower())[1]
+    return ext in ['.sldprt', '.sldasm']
+
+
+# =============================================================================
+# REQUEST/RESPONSE MODELS
+# =============================================================================
+
 class AnalyzeRequest(BaseModel):
     fileBase64: str
     fileName: str
@@ -81,8 +302,13 @@ class AnalyzeResponse(BaseModel):
     volume: Optional[float] = None
     surfaceArea: Optional[float] = None
     meshData: Optional[UnifiedMeshData] = None
+    convertedFromFormat: Optional[str] = None  # Tracks if file was converted
     error: Optional[str] = None
 
+
+# =============================================================================
+# STEP FILE PROCESSING
+# =============================================================================
 
 def read_step_file(file_content: bytes) -> 'TopoDS_Shape':
     """Read STEP file from bytes and return the shape."""
@@ -467,22 +693,85 @@ def generate_mesh_data(shape, features: list) -> UnifiedMeshData:
     )
 
 
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "pythonocc-api"}
+    return {
+        "status": "healthy", 
+        "service": "pythonocc-api",
+        "version": API_VERSION,
+        "versionDate": API_VERSION_DATE,
+        "freecadAvailable": FREECAD_AVAILABLE,
+        "freecadPath": FREECAD_PATH
+    }
+
+
+@app.get("/version")
+async def get_version():
+    """Get API version information."""
+    return {
+        "version": API_VERSION,
+        "versionDate": API_VERSION_DATE,
+        "name": "PythonOCC STEP Analyzer API",
+        "supportedFormats": get_supported_extensions(),
+        "freecadAvailable": FREECAD_AVAILABLE,
+        "changelog": [
+            {"version": "1.4.0", "date": "2026-01-05", "changes": [
+                "Added FreeCAD integration for SolidWorks file support",
+                "SLDPRT and SLDASM files now auto-convert to STEP",
+                "Added supported formats endpoint"
+            ]},
+            {"version": "1.3.0", "date": "2025-01-05", "changes": ["Added version endpoint", "Added version tracking"]},
+            {"version": "1.2.0", "date": "2025-01-05", "changes": ["Added mesh generation with triangle-to-feature mapping"]},
+            {"version": "1.1.0", "date": "2025-01-05", "changes": ["Added hole vs boss detection using surface normal analysis"]},
+            {"version": "1.0.0", "date": "2025-01-05", "changes": ["Initial release with basic STEP analysis"]}
+        ]
+    }
+
+
+@app.get("/formats")
+async def get_supported_formats():
+    """Get list of supported file formats."""
+    formats = {
+        "native": [".step", ".stp"],
+        "convertible": [],
+        "all": get_supported_extensions()
+    }
+    
+    if FREECAD_AVAILABLE:
+        formats["convertible"] = [".sldprt", ".sldasm"]
+    
+    return {
+        "formats": formats,
+        "freecadAvailable": FREECAD_AVAILABLE,
+        "note": "Convertible formats require FreeCAD to be installed on the server."
+    }
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_step(request: AnalyzeRequest):
     """
-    Analyze a STEP file and return features, dimensions, and mesh data.
+    Analyze a CAD file and return features, dimensions, and mesh data.
+    Supports STEP files natively, and SolidWorks files (SLDPRT/SLDASM) via FreeCAD conversion.
     """
     try:
         print(f"Analyzing file: {request.fileName}")
         
         # Decode base64 file content
         file_content = base64.b64decode(request.fileBase64)
+        converted_from = None
+        
+        # Check if this is a SolidWorks file that needs conversion
+        if is_solidworks_file(request.fileName):
+            print(f"Detected SolidWorks file, converting to STEP...")
+            original_ext = os.path.splitext(request.fileName.lower())[1]
+            file_content = convert_solidworks_to_step(file_content, request.fileName)
+            converted_from = original_ext.upper().replace(".", "")
+            print(f"Conversion complete, proceeding with STEP analysis")
         
         # Read STEP file
         shape = read_step_file(file_content)
@@ -515,11 +804,12 @@ async def analyze_step(request: AnalyzeRequest):
             dimensions=dimensions,
             volume=volume,
             surfaceArea=surface_area,
-            meshData=mesh_data
+            meshData=mesh_data,
+            convertedFromFormat=converted_from
         )
         
     except Exception as e:
-        print(f"Error analyzing STEP file: {str(e)}")
+        print(f"Error analyzing CAD file: {str(e)}")
         import traceback
         traceback.print_exc()
         return AnalyzeResponse(
@@ -532,6 +822,37 @@ async def analyze_step(request: AnalyzeRequest):
 async def analyze_step_alias(request: AnalyzeRequest):
     """Alias endpoint for compatibility."""
     return await analyze_step(request)
+
+
+@app.post("/convert")
+async def convert_file(request: AnalyzeRequest):
+    """
+    Convert a SolidWorks file to STEP format without full analysis.
+    Returns the converted STEP file as base64.
+    """
+    try:
+        if not is_solidworks_file(request.fileName):
+            return {
+                "success": False,
+                "error": "File is not a SolidWorks format. Only SLDPRT and SLDASM files can be converted."
+            }
+        
+        file_content = base64.b64decode(request.fileBase64)
+        step_content = convert_solidworks_to_step(file_content, request.fileName)
+        
+        return {
+            "success": True,
+            "stepBase64": base64.b64encode(step_content).decode('utf-8'),
+            "originalFormat": os.path.splitext(request.fileName.lower())[1].upper().replace(".", ""),
+            "originalSize": len(file_content),
+            "convertedSize": len(step_content)
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 if __name__ == "__main__":
