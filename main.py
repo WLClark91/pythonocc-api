@@ -11,8 +11,9 @@
 # v1.4.1 (2026-01-05) - Enhanced headless FreeCAD support with xvfb, improved error handling
 # v1.5.0 (2026-01-05) - Improved pocket detection with concavity, wall, depth, and boundary analysis
 # v1.6.0 (2026-01-05) - Revised pocket criteria: edge-sharing walls (no count), 0.01mm depth, slot classification
+# v1.6.1 (2026-01-05) - Fixed TopExp import: use 'topexp' module (lowercase) for pythonOCC 7.7.0 compatibility
 
-API_VERSION = "1.6.0"
+API_VERSION = "1.6.1"
 API_VERSION_DATE = "2026-01-05"
 
 import base64
@@ -1354,4 +1355,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
