@@ -33,7 +33,7 @@ from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_REVERSED, TopAbs_WIRE
-from OCC.Core.TopExp import TopExp
+from OCC.Core.TopExp import topexp
 from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.TopLoc import TopLoc_Location
@@ -635,7 +635,7 @@ def check_face_concavity(face, shape) -> Tuple[bool, float]:
 def build_face_adjacency_map(shape) -> TopTools_IndexedDataMapOfShapeListOfShape:
     """Build a map of edges to their adjacent faces for topology analysis."""
     edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
-    TopExp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_face_map)
+    topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_face_map)
     return edge_face_map
 
 
@@ -1354,3 +1354,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
