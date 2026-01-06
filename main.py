@@ -16,9 +16,14 @@
 #                       with stock face tagging, area, orientation, and curvature complexity parameters
 # v1.7.1 (2026-01-05) - Enhanced hole detection: added arc angle (>=270°) and circular edge criteria to prevent
 #                       external curved surfaces from being misclassified as holes
+# v1.8.0 (2026-01-06) - Refined cylindrical surface classification:
+#                       - hole: inward-facing + circular edge + arc >= 270°
+#                       - boss: outward-facing + circular edge + arc >= 270°
+#                       - cylindrical_face: outward-facing + has circular edge (any arc)
+#                       - curved_surface: all other cylindrical surfaces
 
-API_VERSION = "1.7.1"
-API_VERSION_DATE = "2026-01-05"
+API_VERSION = "1.8.0"
+API_VERSION_DATE = "2026-01-06"
 
 import base64
 import io
@@ -544,24 +549,19 @@ def check_cylindrical_face_closure(face) -> Tuple[bool, int]:
         return (False, 0)
 
 
-def is_cylindrical_face_a_boss(face, adaptor) -> tuple:
+def classify_cylindrical_face(face, adaptor) -> tuple:
     """
-    Determine if a cylindrical face is a BOSS, HOLE, or external CYLINDRICAL_SURFACE.
+    Classify a cylindrical face into one of four categories:
+    - hole: inward-facing + circular edge + arc >= 270°
+    - boss: outward-facing + circular edge + arc >= 270°
+    - cylindrical_face: outward-facing + has any circular edge
+    - curved_surface: all other cylindrical surfaces
     
-    v1.7.1: Enhanced hole detection with stricter qualifying criteria to avoid
-    misclassifying external curved surfaces as holes.
-    
-    QUALIFYING CRITERIA FOR HOLE/BOSS:
-    1. Surface normal direction (inward = hole candidate, outward = boss candidate)
-    2. Arc angle >= 270° (mostly closed cylindrical surface)
-    3. At least one circular edge (indicates true cylindrical feature, not fillet-like)
-    
-    If a cylindrical face fails criteria 2 or 3, it's classified as a 
-    cylindrical_surface instead of hole/boss.
+    v1.8.0: Refined classification with clear distinction between feature types.
     
     Returns:
-        tuple: (is_boss: bool, confidence: float, normal_direction: str, is_valid_feature: bool)
-               is_valid_feature=False means it should be classified as cylindrical_surface
+        tuple: (classification: str, confidence: float, normal_direction: str)
+               classification is one of: 'hole', 'boss', 'cylindrical_face', 'curved_surface'
     """
     try:
         cylinder = adaptor.Cylinder()
@@ -571,35 +571,28 @@ def is_cylindrical_face_a_boss(face, adaptor) -> tuple:
         axis_loc = axis.Location()
         
         # =================================================================
-        # CRITERION 1: Arc angle check (must cover most of a circle)
+        # CRITERION 1: Arc angle (how much of a circle it covers)
         # =================================================================
         arc_angle = get_cylindrical_face_arc_angle(face, adaptor)
         is_mostly_closed = arc_angle >= 270  # At least 270° of arc
         
         # =================================================================
-        # CRITERION 2: Circular edge check (must have circular boundaries)
+        # CRITERION 2: Circular edge check (indicates proper cylindrical feature)
         # =================================================================
         has_circular_edges, circular_edge_count = check_cylindrical_face_closure(face)
         
         # =================================================================
-        # CRITERION 3: Surface normal direction (determines hole vs boss)
+        # CRITERION 3: Surface normal direction (determines inward vs outward)
         # =================================================================
-        # Get UV bounds of the face
         u_min, u_max, v_min, v_max = breptools.UVBounds(face)
-        
-        # Sample point at the middle of the face
         u_mid = (u_min + u_max) / 2.0
         v_mid = (v_min + v_max) / 2.0
         
-        # Get point on surface
         surface_pnt = adaptor.Value(u_mid, v_mid)
-        
-        # Get surface normal at this point using BRepLProp_SLProps
         props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 1, 1e-6)
         
         if not props.IsNormalDefined():
-            # Fallback: if normal not defined, classify as surface
-            return (False, 0.5, "undefined", False)
+            return ("curved_surface", 0.5, "undefined")
         
         normal = props.Normal()
         
@@ -610,58 +603,62 @@ def is_cylindrical_face_a_boss(face, adaptor) -> tuple:
         # Calculate radial direction: from axis to surface point
         point_vec = gp_Vec(axis_loc, surface_pnt)
         axis_vec = gp_Vec(axis_dir)
-        
-        # Projection length along axis
         proj_length = point_vec.Dot(axis_vec)
         
-        # Closest point on axis
         axis_point = gp_Pnt(
             axis_loc.X() + axis_dir.X() * proj_length,
             axis_loc.Y() + axis_dir.Y() * proj_length,
             axis_loc.Z() + axis_dir.Z() * proj_length
         )
         
-        # Radial direction: from axis to surface point
         radial_vec = gp_Vec(axis_point, surface_pnt)
         if radial_vec.Magnitude() > 1e-10:
             radial_vec.Normalize()
         else:
-            return (False, 0.5, "on_axis", False)
+            return ("curved_surface", 0.5, "on_axis")
         
-        # Compare normal with radial direction
         normal_vec = gp_Vec(normal.X(), normal.Y(), normal.Z())
         dot_product = normal_vec.Dot(radial_vec)
         
-        # Determine normal direction
-        is_boss_candidate = dot_product > 0
-        normal_direction = "outward" if is_boss_candidate else "inward"
+        is_outward = dot_product > 0
+        normal_direction = "outward" if is_outward else "inward"
         
         # =================================================================
-        # VALIDATION: All criteria must pass for hole/boss classification
+        # CLASSIFICATION LOGIC (v1.8.0)
         # =================================================================
-        is_valid_feature = is_mostly_closed and has_circular_edges
         
-        if not is_valid_feature:
-            # This is a partial cylindrical surface, not a hole/boss
-            print(f"  [SURFACE] Cylindrical face: arc={arc_angle:.1f}°, circular_edges={circular_edge_count}, r={radius:.2f}mm -> cylindrical_surface")
-            return (is_boss_candidate, 0.5, normal_direction, False)
+        # HOLE: inward-facing + circular edge + arc >= 270°
+        if not is_outward and has_circular_edges and is_mostly_closed:
+            confidence = 0.70
+            confidence += 0.10 if arc_angle >= 350 else 0.05
+            confidence += 0.10 if circular_edge_count >= 2 else 0.05
+            confidence += 0.05 * min(1.0, abs(dot_product))
+            print(f"  [HOLE] arc={arc_angle:.1f}°, circular_edges={circular_edge_count}, r={radius:.2f}mm")
+            return ("hole", min(0.95, confidence), normal_direction)
         
-        # Valid hole or boss
-        confidence = 0.70
-        confidence += 0.10 if arc_angle >= 350 else 0.05  # Nearly full circle
-        confidence += 0.10 if circular_edge_count >= 2 else 0.05  # Both ends closed
-        confidence += 0.05 * min(1.0, abs(dot_product))  # Clear normal direction
+        # BOSS: outward-facing + circular edge + arc >= 270°
+        if is_outward and has_circular_edges and is_mostly_closed:
+            confidence = 0.70
+            confidence += 0.10 if arc_angle >= 350 else 0.05
+            confidence += 0.10 if circular_edge_count >= 2 else 0.05
+            confidence += 0.05 * min(1.0, abs(dot_product))
+            print(f"  [BOSS] arc={arc_angle:.1f}°, circular_edges={circular_edge_count}, r={radius:.2f}mm")
+            return ("boss", min(0.95, confidence), normal_direction)
         
-        confidence = min(0.95, confidence)
+        # CYLINDRICAL_FACE: outward-facing + has circular edge (any arc)
+        if is_outward and has_circular_edges:
+            confidence = 0.75
+            confidence += 0.10 if arc_angle >= 180 else 0.0
+            print(f"  [CYLINDRICAL_FACE] arc={arc_angle:.1f}°, circular_edges={circular_edge_count}, r={radius:.2f}mm")
+            return ("cylindrical_face", min(0.90, confidence), normal_direction)
         
-        feature_type = "boss" if is_boss_candidate else "hole"
-        print(f"  [FEATURE] Cylindrical face: arc={arc_angle:.1f}°, circular_edges={circular_edge_count}, r={radius:.2f}mm -> {feature_type}")
-        
-        return (is_boss_candidate, confidence, normal_direction, True)
+        # CURVED_SURFACE: all other cylindrical surfaces
+        print(f"  [CURVED_SURFACE] arc={arc_angle:.1f}°, circular_edges={circular_edge_count}, r={radius:.2f}mm, dir={normal_direction}")
+        return ("curved_surface", 0.70, normal_direction)
         
     except Exception as e:
-        print(f"Error determining boss/hole: {e}")
-        return (False, 0.5, "error", False)
+        print(f"Error classifying cylindrical face: {e}")
+        return ("curved_surface", 0.5, "error")
 
 
 # =============================================================================
@@ -812,11 +809,20 @@ def get_curvature_complexity(adaptor, surface_type) -> dict:
     }
 
 
-def surface_type_to_feature_type(surface_type) -> str:
-    """Map OCC surface type to feature type string."""
+def surface_type_to_feature_type(surface_type, cylindrical_classification: str = None) -> str:
+    """
+    Map OCC surface type to feature type string.
+    
+    For cylindrical surfaces, use the cylindrical_classification parameter
+    to distinguish between cylindrical_face and curved_surface.
+    """
+    # For cylindrical surfaces, use the classification result
+    if surface_type == GeomAbs_Cylinder and cylindrical_classification:
+        return cylindrical_classification
+    
     type_map = {
         GeomAbs_Plane: "planar_surface",
-        GeomAbs_Cylinder: "cylindrical_surface",
+        GeomAbs_Cylinder: "curved_surface",  # Default fallback for cylinder
         GeomAbs_Cone: "conical_surface",
         GeomAbs_Sphere: "spherical_surface",
         GeomAbs_Torus: "toroidal_surface",
@@ -834,9 +840,13 @@ def analyze_face_as_surface(face, face_id: str, adaptor, surface_type, bbox_expa
     """
     Analyze any face as a surface feature with full parameters.
     
+    v1.8.0: For cylindrical surfaces, uses classify_cylindrical_face to determine
+    whether it should be cylindrical_face or curved_surface.
+    
     This captures ALL machined surfaces including:
     - Planar (flat) surfaces
-    - Cylindrical surfaces  
+    - Cylindrical faces (outward + circular edge)
+    - Curved surfaces (other cylindrical)
     - Conical surfaces
     - Spherical surfaces
     - Toroidal surfaces
@@ -860,8 +870,15 @@ def analyze_face_as_surface(face, face_id: str, adaptor, surface_type, bbox_expa
         # Check if stock face
         is_stock, stock_boundary = is_stock_face(face, bbox_expanded)
         
-        # Determine feature type
-        feature_type = surface_type_to_feature_type(surface_type)
+        # Determine feature type - special handling for cylindrical surfaces
+        cylindrical_classification = None
+        if surface_type == GeomAbs_Cylinder:
+            classification, conf, normal_dir = classify_cylindrical_face(face, adaptor)
+            # Only use classification if it's a surface type (not hole/boss)
+            if classification in ("cylindrical_face", "curved_surface"):
+                cylindrical_classification = classification
+        
+        feature_type = surface_type_to_feature_type(surface_type, cylindrical_classification)
         
         # Surface-specific parameters
         params = {
@@ -906,7 +923,7 @@ def analyze_face_as_surface(face, face_id: str, adaptor, surface_type, bbox_expa
             metadata=FeatureMetadata(
                 faceIds=[face_id],
                 confidence=confidence,
-                detectionMethod="surface_analysis_v1.7"
+                detectionMethod="surface_analysis_v1.8.0"
             )
         )
         
@@ -1285,9 +1302,9 @@ def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
     """
     Analyze a single face to detect if it's part of a manufacturing feature.
     
-    v1.7.1: Enhanced cylindrical face detection with stricter criteria.
-    Cylindrical faces that don't qualify as holes/bosses return None and
-    will be classified as cylindrical_surface in the surface detection pass.
+    v1.8.0: Uses classify_cylindrical_face for refined cylindrical classification.
+    Returns manufacturing features (hole, boss) only. Surface features
+    (cylindrical_face, curved_surface) are handled in the surface detection pass.
     
     Note: Pocket detection is handled separately in extract_features using enhanced logic.
     """
@@ -1295,7 +1312,7 @@ def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
         adaptor = BRepAdaptor_Surface(face)
         surface_type = adaptor.GetType()
         
-        # Cylindrical face -> could be hole, boss, or just a curved surface
+        # Cylindrical face -> could be hole, boss, cylindrical_face, or curved_surface
         if surface_type == GeomAbs_Cylinder:
             cylinder = adaptor.Cylinder()
             radius = cylinder.Radius()
@@ -1305,29 +1322,28 @@ def analyze_face_for_feature(face, face_id: str) -> Optional[ExtractedFeature]:
                                       adaptor.FirstVParameter(), adaptor.LastVParameter()
             height_or_depth = abs(vmax - vmin)
             
-            # Use enhanced analysis to determine hole/boss/surface
-            is_boss, confidence, normal_direction, is_valid_feature = is_cylindrical_face_a_boss(face, adaptor)
+            # Use v1.8.0 classification
+            classification, confidence, normal_direction = classify_cylindrical_face(face, adaptor)
             
-            # If not a valid hole/boss, return None - it will be classified as cylindrical_surface
-            if not is_valid_feature:
+            # Only return manufacturing features (hole, boss)
+            # cylindrical_face and curved_surface are handled in surface detection
+            if classification not in ("hole", "boss"):
                 return None
             
-            if is_boss:
-                feature_type = "boss"
+            if classification == "boss":
                 params = {"diameter": round(radius * 2, 2), "height": round(height_or_depth, 2)}
             else:
-                feature_type = "hole"
                 params = {"diameter": round(radius * 2, 2), "depth": round(height_or_depth, 2)}
             
             return ExtractedFeature(
-                type=feature_type,
+                type=classification,
                 parameters=params,
                 location=get_face_centroid(face),
                 id=str(uuid.uuid4()),
                 metadata=FeatureMetadata(
                     faceIds=[face_id],
                     confidence=confidence,
-                    detectionMethod="cylindrical_strict_criteria_v1.7.1",
+                    detectionMethod="cylindrical_classification_v1.8.0",
                     normalDirection=normal_direction
                 )
             )
