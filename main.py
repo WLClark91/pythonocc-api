@@ -21,8 +21,12 @@
 #                       - boss: outward-facing + circular edge + arc >= 270°
 #                       - cylindrical_face: outward-facing + has circular edge (any arc)
 #                       - curved_surface: all other cylindrical surfaces
+# v1.9.0 (2026-01-06) - Enhanced pocket/slot detection with geometric proximity fallback:
+#                       - Added edge proximity detection when topological edge sharing fails
+#                       - Samples edge endpoints and checks if they lie on adjacent face boundaries
+#                       - Resolves pocket detection failures in STEP files with non-shared edges
 
-API_VERSION = "1.8.0"
+API_VERSION = "1.9.0"
 API_VERSION_DATE = "2026-01-06"
 
 import base64
@@ -999,10 +1003,167 @@ def build_face_adjacency_map(shape) -> TopTools_IndexedDataMapOfShapeListOfShape
     return edge_face_map
 
 
+def get_edge_sample_points(edge, num_samples: int = 5) -> list:
+    """
+    Get sample points along an edge for geometric proximity checking.
+    Returns list of (x, y, z) tuples.
+    """
+    try:
+        curve_adaptor = BRepAdaptor_Curve(edge)
+        u_min = curve_adaptor.FirstParameter()
+        u_max = curve_adaptor.LastParameter()
+        
+        points = []
+        for i in range(num_samples):
+            t = i / (num_samples - 1) if num_samples > 1 else 0.5
+            u = u_min + t * (u_max - u_min)
+            pnt = curve_adaptor.Value(u)
+            points.append((pnt.X(), pnt.Y(), pnt.Z()))
+        
+        return points
+    except:
+        return []
+
+
+def point_near_face_boundary(point: tuple, face, tolerance: float = 0.1) -> bool:
+    """
+    Check if a point lies near the boundary of a face.
+    Uses distance to face edges as the metric.
+    """
+    try:
+        px, py, pz = point
+        test_point = gp_Pnt(px, py, pz)
+        
+        # Explore edges of the face and check distance
+        edge_explorer = TopExp_Explorer(face, TopAbs_EDGE)
+        while edge_explorer.More():
+            edge = edge_explorer.Current()
+            curve_adaptor = BRepAdaptor_Curve(edge)
+            
+            # Sample points on this edge and find minimum distance
+            u_min = curve_adaptor.FirstParameter()
+            u_max = curve_adaptor.LastParameter()
+            
+            for t in [0.0, 0.25, 0.5, 0.75, 1.0]:
+                u = u_min + t * (u_max - u_min)
+                edge_pnt = curve_adaptor.Value(u)
+                dist = test_point.Distance(edge_pnt)
+                
+                if dist < tolerance:
+                    return True
+            
+            edge_explorer.Next()
+        
+        return False
+    except:
+        return False
+
+
+def find_geometrically_adjacent_walls(floor_face, floor_normal_vec, shape, seen_faces: set, tolerance: float = 0.5) -> list:
+    """
+    Find wall faces that are geometrically adjacent to the floor face.
+    This is a fallback when topological edge sharing detection fails.
+    
+    Checks if floor edge sample points lie near the boundaries of potential wall faces.
+    """
+    adjacent_walls = []
+    wall_index = 0
+    
+    try:
+        # Collect sample points from all edges of the floor face
+        floor_edge_points = []
+        edge_explorer = TopExp_Explorer(floor_face, TopAbs_EDGE)
+        while edge_explorer.More():
+            edge = edge_explorer.Current()
+            floor_edge_points.extend(get_edge_sample_points(edge, 3))
+            edge_explorer.Next()
+        
+        if not floor_edge_points:
+            return adjacent_walls
+        
+        # Check all faces in the shape
+        face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
+        while face_explorer.More():
+            candidate_face = topods.Face(face_explorer.Current())
+            face_hash = candidate_face.__hash__()
+            
+            # Skip if same face or already seen
+            if candidate_face.IsSame(floor_face) or face_hash in seen_faces:
+                face_explorer.Next()
+                continue
+            
+            # Check surface type (only planar and cylindrical walls)
+            adaptor = BRepAdaptor_Surface(candidate_face)
+            surface_type = adaptor.GetType()
+            is_planar_wall = surface_type == GeomAbs_Plane
+            is_curved_wall = surface_type == GeomAbs_Cylinder
+            
+            if not (is_planar_wall or is_curved_wall):
+                face_explorer.Next()
+                continue
+            
+            # Get candidate face normal
+            u_min, u_max, v_min, v_max = breptools.UVBounds(candidate_face)
+            u_mid, v_mid = (u_min + u_max) / 2.0, (v_min + v_max) / 2.0
+            
+            props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 1, 1e-6)
+            if not props.IsNormalDefined():
+                face_explorer.Next()
+                continue
+            
+            normal = props.Normal()
+            if candidate_face.Orientation() == TopAbs_REVERSED:
+                normal.Reverse()
+            candidate_normal_vec = gp_Vec(normal.X(), normal.Y(), normal.Z())
+            
+            # Check if roughly perpendicular to floor (wall criterion)
+            dot = abs(floor_normal_vec.Dot(candidate_normal_vec))
+            if dot >= 0.3:  # Not perpendicular enough
+                face_explorer.Next()
+                continue
+            
+            # Check geometric proximity: do any floor edge points lie near this face's boundary?
+            points_near_boundary = 0
+            for point in floor_edge_points:
+                if point_near_face_boundary(point, candidate_face, tolerance):
+                    points_near_boundary += 1
+            
+            # Require at least 2 points to be near boundary for confidence
+            if points_near_boundary >= 2:
+                seen_faces.add(face_hash)
+                
+                wall_props = GProp_GProps()
+                brepgprop.SurfaceProperties(candidate_face, wall_props)
+                wall_area = wall_props.Mass()
+                wall_center = wall_props.CentreOfMass()
+                
+                wall_type = "curved" if is_curved_wall else "planar"
+                
+                adjacent_walls.append({
+                    "id": f"geom_wall_{wall_index}",
+                    "area": wall_area,
+                    "center_z": wall_center.Z(),
+                    "max_z": get_face_max_z(candidate_face),
+                    "wall_type": wall_type,
+                    "detection": "geometric_proximity"
+                })
+                wall_index += 1
+                print(f"    [GEOM] Found wall via geometric proximity ({points_near_boundary} points matched)")
+            
+            face_explorer.Next()
+        
+    except Exception as e:
+        print(f"Error in geometric wall detection: {e}")
+    
+    return adjacent_walls
+
+
 def find_adjacent_enclosing_walls(face, shape, edge_face_map) -> list:
     """
     Find faces that share edges with this face and are roughly vertical
     (potential pocket walls). Includes both planar and curved (e.g., cylindrical) walls.
+    
+    v1.9.0: Now includes geometric proximity fallback when topological edge sharing fails.
     
     A wall face has a normal that is roughly perpendicular to the floor normal
     (dot product close to 0). The count of walls does not matter - a circular
@@ -1032,11 +1193,14 @@ def find_adjacent_enclosing_walls(face, shape, edge_face_map) -> list:
         edge_explorer = TopExp_Explorer(face, TopAbs_EDGE)
         seen_faces = set()
         wall_index = 0
+        edges_with_no_match = 0
+        total_edges = 0
         
         while edge_explorer.More():
             edge = edge_explorer.Current()
+            total_edges += 1
             
-            # Find faces sharing this edge
+            # Find faces sharing this edge (topological approach)
             edge_index = edge_face_map.FindIndex(edge)
             if edge_index > 0:
                 adjacent_face_list = edge_face_map.FindFromIndex(edge_index)
@@ -1090,11 +1254,24 @@ def find_adjacent_enclosing_walls(face, shape, edge_face_map) -> list:
                             "area": wall_area,
                             "center_z": wall_center.Z(),
                             "max_z": get_face_max_z(topods.Face(adj_face)),
-                            "wall_type": wall_type
+                            "wall_type": wall_type,
+                            "detection": "topological"
                         })
                         wall_index += 1
+            else:
+                edges_with_no_match += 1
             
             edge_explorer.Next()
+        
+        # v1.9.0: GEOMETRIC PROXIMITY FALLBACK
+        # If topological edge detection found no walls, try geometric proximity
+        if len(adjacent_walls) == 0 and total_edges > 0:
+            print(f"    [FALLBACK] Topological detection found 0 walls ({edges_with_no_match}/{total_edges} edges unmatched). Trying geometric proximity...")
+            geometric_walls = find_geometrically_adjacent_walls(face, floor_normal_vec, shape, seen_faces, tolerance=0.5)
+            adjacent_walls.extend(geometric_walls)
+            
+            if len(geometric_walls) > 0:
+                print(f"    [FALLBACK] Geometric proximity found {len(geometric_walls)} walls")
         
     except Exception as e:
         print(f"Error finding adjacent walls: {e}")
